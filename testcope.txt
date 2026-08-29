@@ -1,1 +1,4 @@
 python -c "import serial; print('SERIAL:', serial.__file__)"
+
+
+python -c "import cv2; print('CV2:', cv2.__file__)"

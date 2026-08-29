@@ -2,3 +2,62 @@ python -c "import serial; print('SERIAL:', serial.__file__)"
 
 
 python -c "import cv2; print('CV2:', cv2.__file__)"
+
+
+
+
+The Haar XML is not the problem. The traceback says:
+
+```text
+AttributeError: module 'cv2' has no attribute 'CascadeClassifier'
+```
+
+So Python imported an incorrect or incomplete `cv2` module before it even tried opening the XML. Your `find` output confirms the XML path exists.
+
+Inside the activated virtual environment, run:
+
+```bash
+python -c "import cv2; print('file:', cv2.__file__); print('version:', getattr(cv2, '__version__', 'MISSING')); print('CascadeClassifier:', hasattr(cv2, 'CascadeClassifier'))"
+
+python -m pip list | grep -Ei 'opencv|cv2'
+
+find . -maxdepth 2 \( -name 'cv2.py' -o -name 'cv2' \)
+```
+
+If there is no local `cv2.py` or `cv2/` folder, reinstall OpenCV cleanly:
+
+```bash
+python -m pip uninstall -y cv2 opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless
+
+python -m pip install --upgrade pip
+python -m pip install --no-cache-dir opencv-python
+```
+
+Use only one OpenCV package because all OpenCV variants provide the same `cv2` namespace. Since your program uses `cv2.imshow`, install `opencv-python`, not the headless version. [opencv-python package guidance](https://pypi.org/project/opencv-python/)
+
+Verify afterward:
+
+```bash
+python -c "import cv2; print(cv2.__version__); print(cv2.CascadeClassifier)"
+```
+
+Then test the cascade:
+
+```bash
+python - <<'PY'
+import cv2
+
+path = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+cascade = cv2.CascadeClassifier(path)
+
+print("Cascade loaded:", not cascade.empty())
+PY
+```
+
+Expected output:
+
+```text
+Cascade loaded: True
+```
+
+Also, the screenshot shows `Audio output: Bluetooth headset (...)`, so Bluetooth detection is already working correctly.

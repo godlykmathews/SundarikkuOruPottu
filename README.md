@@ -62,8 +62,21 @@ sudo apt install -y python3-venv espeak pulseaudio-utils libgl1
 
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
+
+If OpenCV is incomplete or `cv2.CascadeClassifier` is missing, clean all
+conflicting OpenCV packages once and reinstall the requirements:
+
+```bash
+python -m pip uninstall -y cv2 opencv-python opencv-python-headless \
+  opencv-contrib-python opencv-contrib-python-headless
+python -m pip install --no-cache-dir --force-reinstall -r requirements.txt
+python -c "import cv2; print(cv2.__version__, cv2.CascadeClassifier)"
+```
+
+For later reinstalls, only the second and third commands are needed.
 
 Run the prototype:
 

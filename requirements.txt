@@ -1,3 +1,5 @@
-opencv-python
-numpy
-pyserial
+# Full OpenCV build is required because model.py uses cv2.imshow.
+# Do not install cv2, opencv-*-headless, or opencv-contrib-* beside this package.
+opencv-python==5.0.0.93
+numpy>=2.0,<3.0
+pyserial==3.5

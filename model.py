@@ -43,20 +43,21 @@ def speak_gtts(text):
 # Initialize Serial Connection to ESP32
 # Replace 'COM3' with your actual ESP32 COM port
 try:
-    ser = serial.Serial('COM3', 115200, timeout=1)
+    ser = None
+    #ser = serial.Serial('COM3', 115200, timeout=1)
     time.sleep(2)  # Give ESP32 time to reset after opening connection
     print("Serial connected to ESP32!")
 except Exception as e:
     print(f"Serial connection error: {e}")
     ser = None
 
-xml_filename = "haarcascade_frontalface_default.xml"
+xml_filename = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
 face_cascade = cv2.CascadeClassifier(xml_filename)
 
 if face_cascade.empty():
     raise IOError(f"Could not load Haar Cascade XML from file: {xml_filename}")
 
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
 
 while cap.isOpened():
     ret, frame = cap.read()

@@ -1,44 +1,341 @@
+import atexit
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import cv2
-from gtts import gTTS
 import numpy as np
 import serial
 
-last_speech_time = 0
 speech_cooldown = 2.5  # Seconds between spoken instructions
-is_speaking = False
 
-def speak_gtts(text):
-    """Generate and play Google TTS audio using native Windows Media Player COM API."""
-    global is_speaking
-    is_speaking = True
-    temp_mp3 = os.path.abspath("temp_guidance.mp3")
-    try:
-        # 1. Save gTTS to MP3
-        tts = gTTS(text=text, lang='en')
-        tts.save(temp_mp3)
-        
-        # 2. Use Windows Media Player COM object to play MP3 natively
-        ps_cmd = (
-            f'$player = New-Object -ComObject WMPlayer.OCX; '
-            f'$player.URL = "{temp_mp3}"; '
-            f'$player.controls.play(); '
-            f'while ($player.playState -ne 1) {{ Start-Sleep -Milliseconds 100 }}'
+
+class BluetoothAudio:
+    """Speak guidance through a connected Bluetooth headset without blocking video."""
+
+    PROCESS_TIMEOUT = 3
+
+    def __init__(self):
+        self._state_lock = threading.Lock()
+        self._is_speaking = False
+        self._thread = None
+        self._latest_text = None
+        self._last_attempt_text = None
+        self._last_attempt_time = 0
+        self._last_delivered_text = None
+        self._last_delivery_time = 0
+        self._cancel_generation = 0
+
+        self._espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+        self._paplay = shutil.which("paplay")
+        self._pactl = shutil.which("pactl")
+        self._say = shutil.which("say")
+        self._powershell = shutil.which("powershell") or shutil.which("pwsh")
+
+        # Set this when more than one Bluetooth output is connected. Example:
+        # POTTU_AUDIO_SINK=bluez_output.XX_XX_XX_XX_XX_XX.1 python model.py
+        self._sink_override = os.environ.get("POTTU_AUDIO_SINK", "").strip() or None
+        self._cached_sink = None
+        self._last_sink_check = 0
+
+        self._print_output_status()
+
+    def _find_bluetooth_sink(self):
+        """Return a connected Pulse/PipeWire Bluetooth sink name, if available."""
+        if self._sink_override:
+            return self._sink_override
+
+        if not self._pactl:
+            return None
+
+        try:
+            result = subprocess.run(
+                [self._pactl, "list", "short", "sinks"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=0.75,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+        bluetooth_sinks = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+
+            sink_name = fields[1]
+            if "bluez" in line.lower() or "bluetooth" in line.lower():
+                bluetooth_sinks.append(sink_name)
+
+        if not bluetooth_sinks:
+            return None
+
+        # Respect the user's selected default when it is one of the headsets.
+        try:
+            default_result = subprocess.run(
+                [self._pactl, "get-default-sink"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=0.75,
+            )
+            default_sink = default_result.stdout.strip()
+            if default_sink in bluetooth_sinks:
+                return default_sink
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        return bluetooth_sinks[0]
+
+    def _get_bluetooth_sink(self, force_refresh=False):
+        if self._sink_override:
+            return self._sink_override
+
+        now = time.monotonic()
+        if force_refresh or now - self._last_sink_check >= 5:
+            self._last_sink_check = now
+            self._cached_sink = self._find_bluetooth_sink()
+
+        return self._cached_sink
+
+    def _print_output_status(self):
+        if sys.platform.startswith("linux"):
+            if not self._espeak:
+                print("Audio disabled: install 'espeak-ng' or 'espeak'.")
+                return
+
+            sink = self._get_bluetooth_sink(force_refresh=True)
+            if self._sink_override and self._paplay:
+                print(f"Audio output: configured sink ({self._sink_override})")
+            elif sink and self._paplay:
+                print(f"Audio output: Bluetooth headset ({sink})")
+            elif self._paplay:
+                print("Audio output: system default (no Bluetooth sink detected yet)")
+            else:
+                print("Audio output: system default (install 'pulseaudio-utils' for direct Bluetooth routing)")
+        elif sys.platform == "darwin" and self._say:
+            print("Audio output: macOS system default")
+        elif sys.platform == "win32" and self._powershell:
+            print("Audio output: Windows system default")
+        else:
+            print("Audio disabled: no supported speech command was found.")
+
+    def request(self, text, cooldown):
+        """Speak changed guidance immediately and repeat it after the cooldown."""
+        now = time.monotonic()
+
+        with self._state_lock:
+            # A busy worker uses this value to avoid retrying an obsolete direction.
+            self._latest_text = text
+            if self._is_speaking:
+                return False
+
+            if (
+                text == self._last_delivered_text
+                and now - self._last_delivery_time <= cooldown
+            ):
+                return False
+
+            if (
+                text == self._last_attempt_text
+                and now - self._last_attempt_time <= cooldown
+            ):
+                return False
+
+            self._is_speaking = True
+            self._last_attempt_text = text
+            self._last_attempt_time = now
+            generation = self._cancel_generation
+
+        thread = threading.Thread(
+            target=self._speak,
+            args=(text, generation),
+            daemon=True,
         )
-        os.system(f'powershell -c "{ps_cmd}" > NUL 2>&1')
+        self._thread = thread
 
-    except Exception as e:
-        print(f"gTTS Error: {e}")
-    finally:
-        # Clean up temporary audio files
-        if os.path.exists(temp_mp3):
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._state_lock:
+                self._is_speaking = False
+                self._last_attempt_text = None
+            raise
+
+        return True
+
+    def cancel(self):
+        """Prevent an in-flight failure from retrying stale guidance."""
+        with self._state_lock:
+            self._cancel_generation += 1
+            self._latest_text = None
+            self._last_attempt_text = None
+            self._last_delivered_text = None
+            self._last_delivery_time = 0
+
+    def _is_current(self, text, generation):
+        with self._state_lock:
+            return (
+                self._latest_text == text
+                and self._cancel_generation == generation
+            )
+
+    def _speak(self, text, generation):
+        outcome = False
+
+        try:
+            if sys.platform.startswith("linux"):
+                outcome = self._speak_linux(text, generation)
+            elif sys.platform == "darwin" and self._say:
+                if not self._is_current(text, generation):
+                    outcome = None
+                else:
+                    subprocess.run(
+                        [self._say, "-r", "170", text],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=self.PROCESS_TIMEOUT,
+                    )
+                    outcome = True
+            elif sys.platform == "win32" and self._powershell:
+                if not self._is_current(text, generation):
+                    outcome = None
+                else:
+                    script = (
+                        "Add-Type -AssemblyName System.Speech; "
+                        "$voice = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                        "$voice.Speak($args[0])"
+                    )
+                    subprocess.run(
+                        [self._powershell, "-NoProfile", "-Command", script, text],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=self.PROCESS_TIMEOUT,
+                    )
+                    outcome = True
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"Audio playback error: {error}")
+        finally:
+            with self._state_lock:
+                if outcome is True and generation == self._cancel_generation:
+                    self._last_delivered_text = text
+                    self._last_delivery_time = time.monotonic()
+                elif outcome is None and self._last_attempt_text == text:
+                    # Cancellation should be eligible for an immediate fresh attempt.
+                    self._last_attempt_text = None
+
+                self._is_speaking = False
+
+    def _speak_linux(self, text, generation):
+        if not self._espeak:
+            return False
+
+        # paplay sends a new audio stream straight to the selected Bluetooth sink.
+        # eSpeak's direct playback remains a fallback when Pulse/PipeWire tools are absent.
+        if not self._paplay:
+            if not self._is_current(text, generation):
+                return None
+
+            self._speak_espeak_default(text)
+            return True
+
+        descriptor, wav_path = tempfile.mkstemp(prefix="pottu_", suffix=".wav")
+        os.close(descriptor)
+
+        try:
+            subprocess.run(
+                [self._espeak, "-s", "170", "-w", wav_path, text],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=self.PROCESS_TIMEOUT,
+            )
+
+            if not self._is_current(text, generation):
+                return None
+
+            sink = self._get_bluetooth_sink()
+            if not self._is_current(text, generation):
+                return None
+
             try:
-                os.remove(temp_mp3)
-            except Exception:
+                self._play_wav(wav_path, sink or "@DEFAULT_SINK@")
+                return True
+            except (OSError, subprocess.SubprocessError) as error:
+                self._last_sink_check = 0
+                print(f"Selected audio output failed: {error}")
+
+                if not self._is_current(text, generation):
+                    return None
+
+                # A configured or recently disconnected sink may be stale.
+                # Retry once through the live system default before ALSA fallback.
+                if sink:
+                    try:
+                        self._play_wav(wav_path, "@DEFAULT_SINK@")
+                        return True
+                    except (OSError, subprocess.SubprocessError) as default_error:
+                        error = default_error
+
+                if not self._is_current(text, generation):
+                    return None
+
+                print(
+                    "Pulse/PipeWire playback failed; using system output: "
+                    f"{error}"
+                )
+                self._speak_espeak_default(text)
+                return True
+        finally:
+            try:
+                os.remove(wav_path)
+            except FileNotFoundError:
                 pass
-        is_speaking = False
+
+    def _play_wav(self, wav_path, sink):
+        subprocess.run(
+            [
+                self._paplay,
+                "--client-name=Pottu Guidance",
+                "--stream-name=Direction",
+                f"--device={sink}",
+                wav_path,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=self.PROCESS_TIMEOUT,
+        )
+
+    def _speak_espeak_default(self, text):
+        subprocess.run(
+            [self._espeak, "-s", "170", text],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=self.PROCESS_TIMEOUT,
+        )
+
+    def close(self):
+        """Allow a short instruction already in progress to finish on shutdown."""
+        self.cancel()
+
+        with self._state_lock:
+            thread = self._thread
+
+        if thread and thread.is_alive():
+            thread.join(timeout=self.PROCESS_TIMEOUT + 0.5)
+
+
+audio = BluetoothAudio()
+atexit.register(audio.close)
 
 # Initialize Serial Connection to ESP32
 # Replace 'COM3' with your actual ESP32 COM port
@@ -149,17 +446,16 @@ while cap.isOpened():
             color = (0, 255, 0)
         else:
             guide_text = f"Move Hand: {' + '.join(directions)}"
-            speech_text = f"Move {' and '.join(directions)}"
+            speech_text = " and ".join(direction.lower() for direction in directions)
             color = (0, 255, 255)
 
         cv2.putText(frame, guide_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         print(f"Distance: {distance}px | Guidance: {guide_text}")
 
-        # Trigger Google TTS spoken instructions periodically in background thread
-        current_time = time.time()
-        if (current_time - last_speech_time > speech_cooldown) and not is_speaking:
-            last_speech_time = current_time
-            threading.Thread(target=speak_gtts, args=(speech_text,), daemon=True).start()
+        audio.request(speech_text, speech_cooldown)
+    else:
+        # Announce the current direction immediately after tracking is reacquired.
+        audio.cancel()
 
     cv2.imshow("Haar Cascade Face Detection", frame)
     if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -167,5 +463,6 @@ while cap.isOpened():
 
 cap.release()
 cv2.destroyAllWindows()
+audio.close()
 if ser and ser.is_open:
     ser.close()

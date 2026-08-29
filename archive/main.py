@@ -1,12 +1,12 @@
 import cv2
 
-from config import Config
-from camera import Camera
-from face_detector import FaceDetector
-from target import TargetDetector
-from pen_tracker import PenTracker
-from controller import Controller
-from audio import Audio
+from archive.config import Config
+from archive.camera import Camera
+from archive.face_detector import FaceDetector
+from archive.target import TargetDetector
+from archive.pen_tracker import PenTracker
+from archive.controller import Controller
+from archive.audio import Audio
 
 
 def main():

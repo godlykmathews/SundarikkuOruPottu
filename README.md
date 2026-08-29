@@ -58,7 +58,7 @@ Connect a USB camera, then install the system and Python dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y python3-venv espeak libgl1
+sudo apt install -y python3-venv espeak pulseaudio-utils libgl1
 
 python3 -m venv venv
 source venv/bin/activate
@@ -68,10 +68,30 @@ pip install -r requirements.txt
 Run the prototype:
 
 ```bash
-python main.py
+python model.py
 ```
 
 Press `Q` in the camera window to exit.
+
+### Bluetooth headset output
+
+Pair and connect the headset in Raspberry Pi OS before starting the app. The
+application automatically prefers a connected Bluetooth audio sink; if none is
+available, it uses the current system default output.
+
+Run the app as the signed-in desktop user (not with `sudo`). Verify that the
+audio server is reachable, then list the available output sink names:
+
+```bash
+pactl info
+pactl list short sinks
+```
+
+If more than one Bluetooth headset is connected, select one explicitly:
+
+```bash
+POTTU_AUDIO_SINK=bluez_output.YOUR_DEVICE_NAME python model.py
+```
 
 ## Working on the Project
 
@@ -105,4 +125,3 @@ Press `Q` in the camera window to exit.
 ## Phase 1 Status
 
 The end-to-end prototype is working. Current development is focused on improving marker stability under different lighting conditions and optimizing camera processing for Raspberry Pi 5 deployment.
-

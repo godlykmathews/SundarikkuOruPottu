@@ -1,4 +1,3 @@
 opencv-python
 numpy
-gTTS
 pyserial

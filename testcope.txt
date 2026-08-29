@@ -1,0 +1,1 @@
+python -c "import serial; print('SERIAL:', serial.__file__)"

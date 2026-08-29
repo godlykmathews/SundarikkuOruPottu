@@ -5,7 +5,6 @@ import cv2
 from gtts import gTTS
 import numpy as np
 import serial
-import winsound
 
 last_speech_time = 0
 speech_cooldown = 2.5  # Seconds between spoken instructions

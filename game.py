@@ -13,7 +13,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections import deque
 from pathlib import Path
 
 import cv2
@@ -143,27 +142,12 @@ PLAYER_EMOJIS = [
     "⚡",
 ]
 
-# Camera gesture recognition settings.
-# A player is selected only after the red marker traces most of a ring
-# around one emoji. Merely pointing at the emoji does not select it.
-EMOJI_GESTURE_WINDOW_SECONDS = float(
+# Camera player selection:
+# Keep the red marker inside an emoji's selection circle for 3 seconds.
+EMOJI_HOLD_SECONDS = float(
     os.environ.get(
-        "POTTU_EMOJI_GESTURE_WINDOW",
-        "3.2",
-    )
-)
-
-EMOJI_ANGLE_BINS = int(
-    os.environ.get(
-        "POTTU_EMOJI_ANGLE_BINS",
-        "24",
-    )
-)
-
-EMOJI_REQUIRED_COVERAGE = float(
-    os.environ.get(
-        "POTTU_EMOJI_REQUIRED_COVERAGE",
-        "0.72",
+        "POTTU_EMOJI_HOLD_SECONDS",
+        "3.0",
     )
 )
 
@@ -1416,7 +1400,7 @@ def leaderboard_rows():
 
 
 # ------------------------------------------------------------
-# Red-marker circular-gesture player selector
+# Red-marker hold-to-select player selector
 # ------------------------------------------------------------
 
 def _emoji_circle_geometry(
@@ -1424,14 +1408,7 @@ def _emoji_circle_geometry(
     height,
 ):
     """
-    Five large player targets in one row.
-
-    Each result:
-      {
-        center: (x, y),
-        radius: ring_radius,
-        emoji: "..."
-      }
+    Five large emoji selection circles in one row.
     """
     count = len(
         PLAYER_EMOJIS
@@ -1499,9 +1476,6 @@ def _draw_emojis_qt(
     frame,
     geometries,
 ):
-    """
-    Render the emoji glyphs using Qt so they do not appear as boxes.
-    """
     from PySide6.QtGui import QPainter
 
     height, width = frame.shape[
@@ -1604,111 +1578,16 @@ def _draw_emojis_qt(
     )
 
 
-def _circle_coverage(
-    points,
-    center,
-    ring_radius,
-):
-    """
-    Measure how much of the emoji ring the red marker has traced.
-
-    We only use trajectory samples that lie in an annulus around the emoji,
-    so moving through the emoji center does not count as selecting it.
-
-    Returns:
-      coverage 0..1
-      valid_point_count
-    """
-    if not points:
-        return (
-            0.0,
-            0,
-        )
-
-    cx, cy = center
-
-    min_radius = (
-        ring_radius
-        * 0.70
-    )
-
-    max_radius = (
-        ring_radius
-        * 1.38
-    )
-
-    occupied_bins = set()
-    valid_count = 0
-
-    for _timestamp, (
-        px,
-        py,
-    ) in points:
-        dx = (
-            px - cx
-        )
-
-        dy = (
-            py - cy
-        )
-
-        distance = math.hypot(
-            dx,
-            dy,
-        )
-
-        if not (
-            min_radius
-            <= distance
-            <= max_radius
-        ):
-            continue
-
-        angle = (
-            math.atan2(
-                dy,
-                dx,
-            )
-            + math.pi
-        ) / (
-            2
-            * math.pi
-        )
-
-        bin_index = int(
-            angle
-            * EMOJI_ANGLE_BINS
-        ) % EMOJI_ANGLE_BINS
-
-        occupied_bins.add(
-            bin_index
-        )
-
-        valid_count += 1
-
-    coverage = (
-        len(
-            occupied_bins
-        )
-        / EMOJI_ANGLE_BINS
-    )
-
-    return (
-        coverage,
-        valid_count,
-    )
-
-
 def run_camera_player_selector():
     """
-    No keyboard/mouse player selection.
+    No keyboard/mouse selection.
 
-    The camera displays five emojis. The physical red marker must trace
-    a circle around one emoji. Once enough angular coverage is detected,
-    that emoji becomes CURRENT_PLAYER and the selector closes.
-
-    This is a real CV gesture:
-      red marker -> trajectory -> annulus filtering -> angular coverage.
+    Flow:
+      camera opens
+      -> 5 emoji player slots appear
+      -> red marker is tracked
+      -> keep marker inside one emoji circle for EMOJI_HOLD_SECONDS
+      -> that emoji player is selected automatically
     """
     if sys.platform.startswith(
         "linux"
@@ -1728,8 +1607,8 @@ def run_camera_player_selector():
             "for player selection."
         )
 
-    recent_points = deque()
-
+    hovered_index = None
+    hover_started = None
     selected_emoji = None
 
     try:
@@ -1745,25 +1624,8 @@ def run_camera_player_selector():
                 raw_frame
             )
 
-            if marker:
-                recent_points.append(
-                    (
-                        now,
-                        marker,
-                    )
-                )
-
-            while (
-                recent_points
-                and now
-                - recent_points[0][0]
-                > EMOJI_GESTURE_WINDOW_SECONDS
-            ):
-                recent_points.popleft()
-
             frame = raw_frame.copy()
 
-            # Cinematic darkened camera background.
             black = np.zeros_like(
                 frame
             )
@@ -1788,32 +1650,54 @@ def run_camera_player_selector():
                 )
             )
 
-            best_index = None
-            best_coverage = 0.0
-            best_valid_count = 0
+            current_index = None
+
+            if marker:
+                mx, my = marker
+
+                for index, item in enumerate(
+                    geometries
+                ):
+                    cx, cy = item[
+                        "center"
+                    ]
+
+                    radius = item[
+                        "radius"
+                    ]
+
+                    if (
+                        math.hypot(
+                            mx - cx,
+                            my - cy,
+                        )
+                        <= radius
+                    ):
+                        current_index = index
+                        break
+
+            # Reset timer whenever marker leaves or moves to another emoji.
+            if current_index != hovered_index:
+                hovered_index = current_index
+
+                hover_started = (
+                    now
+                    if hovered_index is not None
+                    else None
+                )
+
+            held_seconds = (
+                now - hover_started
+                if (
+                    hovered_index is not None
+                    and hover_started is not None
+                )
+                else 0.0
+            )
 
             for index, item in enumerate(
                 geometries
             ):
-                coverage, valid_count = (
-                    _circle_coverage(
-                        recent_points,
-                        item[
-                            "center"
-                        ],
-                        item[
-                            "radius"
-                        ],
-                    )
-                )
-
-                if coverage > best_coverage:
-                    best_index = index
-                    best_coverage = coverage
-                    best_valid_count = (
-                        valid_count
-                    )
-
                 cx, cy = item[
                     "center"
                 ]
@@ -1824,9 +1708,7 @@ def run_camera_player_selector():
 
                 active = (
                     index
-                    == best_index
-                    and coverage
-                    > 0.05
+                    == hovered_index
                 )
 
                 circle_color = (
@@ -1855,16 +1737,13 @@ def run_camera_player_selector():
                     cv2.LINE_AA,
                 )
 
-                # Visualize recognized angular coverage as a progress arc.
-                progress_angle = int(
-                    min(
+                if active:
+                    progress = min(
                         1.0,
-                        coverage,
+                        held_seconds
+                        / EMOJI_HOLD_SECONDS,
                     )
-                    * 360
-                )
 
-                if progress_angle > 0:
                     cv2.ellipse(
                         frame,
                         (
@@ -1872,14 +1751,15 @@ def run_camera_player_selector():
                             cy,
                         ),
                         (
-                            radius
-                            + 8,
-                            radius
-                            + 8,
+                            radius + 8,
+                            radius + 8,
                         ),
                         -90,
                         0,
-                        progress_angle,
+                        int(
+                            360
+                            * progress
+                        ),
                         (
                             255,
                             180,
@@ -1889,7 +1769,6 @@ def run_camera_player_selector():
                         cv2.LINE_AA,
                     )
 
-            # Unicode emoji drawn after OpenCV ring/card graphics.
             frame = _draw_emojis_qt(
                 frame,
                 geometries,
@@ -1897,37 +1776,19 @@ def run_camera_player_selector():
 
             cv2.putText(
                 frame,
-                "CIRCLE YOUR PLAYER EMOJI WITH THE RED MARKER",
+                "KEEP THE RED MARKER ON YOUR EMOJI FOR 3 SECONDS",
                 (
                     24,
                     42,
                 ),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.76,
+                0.72,
                 (
                     255,
                     255,
                     255,
                 ),
                 2,
-                cv2.LINE_AA,
-            )
-
-            cv2.putText(
-                frame,
-                "Trace around the ring - pointing at the center does not select",
-                (
-                    24,
-                    72,
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.46,
-                (
-                    190,
-                    190,
-                    205,
-                ),
-                1,
                 cv2.LINE_AA,
             )
 
@@ -1958,24 +1819,25 @@ def run_camera_player_selector():
                     cv2.LINE_AA,
                 )
 
-            if best_index is not None:
-                percentage = int(
-                    best_coverage
-                    * 100
+            if hovered_index is not None:
+                remaining = max(
+                    0.0,
+                    EMOJI_HOLD_SECONDS
+                    - held_seconds,
                 )
 
                 cv2.putText(
                     frame,
                     (
-                        f"CIRCLE DETECTED: "
-                        f"{percentage}%"
+                        f"HOLD: "
+                        f"{remaining:.1f}s"
                     ),
                     (
                         24,
                         height - 28,
                     ),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
+                    0.60,
                     (
                         220,
                         170,
@@ -1985,23 +1847,13 @@ def run_camera_player_selector():
                     cv2.LINE_AA,
                 )
 
-                # Angular coverage + enough marker samples prevents a single
-                # accidental sweep from logging in a player.
                 if (
-                    best_coverage
-                    >= EMOJI_REQUIRED_COVERAGE
-                    and best_valid_count
-                    >= max(
-                        14,
-                        int(
-                            EMOJI_ANGLE_BINS
-                            * 0.75
-                        ),
-                    )
+                    held_seconds
+                    >= EMOJI_HOLD_SECONDS
                 ):
                     selected_emoji = (
                         PLAYER_EMOJIS[
-                            best_index
+                            hovered_index
                         ]
                     )
 
@@ -2045,8 +1897,7 @@ def run_camera_player_selector():
                 frame,
             )
 
-            # No keyboard is required for normal use.
-            # Escape/Q remains only as an emergency developer exit.
+            # Emergency developer exit only.
             key = (
                 cv2.waitKey(1)
                 & 0xFF
@@ -2079,1182 +1930,6 @@ def run_camera_player_selector():
 
     return None
 
-
-# ------------------------------------------------------------
-# Player selection UI
-# ------------------------------------------------------------
-
-class PlayerSelectWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-
-        self.action = None
-        self.selected_player = None
-        self.loop = QEventLoop()
-
-        self.setWindowTitle("PottuAI Players")
-        self.setMinimumSize(820, 560)
-
-        self.setStyleSheet(
-            """
-            QWidget {
-                background: #060608;
-                color: #f6f6f8;
-            }
-            QLabel#title {
-                color: #c86cff;
-                font-size: 34px;
-                font-weight: 750;
-            }
-            QLabel#hint {
-                color: #92929d;
-                font-size: 15px;
-            }
-            QListWidget {
-                background: #0d0d11;
-                border: 1px solid #292930;
-                border-radius: 20px;
-                padding: 10px;
-                font-size: 19px;
-                outline: none;
-            }
-            QListWidget::item {
-                min-height: 62px;
-                border-radius: 14px;
-                padding: 8px 14px;
-                margin: 3px;
-            }
-            QListWidget::item:selected {
-                background: #33203f;
-            }
-            QLineEdit {
-                background: #101014;
-                color: white;
-                border: 1px solid #34343d;
-                border-radius: 14px;
-                padding: 12px 15px;
-                font-size: 18px;
-            }
-            QPushButton {
-                min-height: 46px;
-                border-radius: 18px;
-                padding: 8px 24px;
-                background: #1a1a20;
-                border: 1px solid #34343d;
-                color: white;
-                font-weight: 650;
-            }
-            QPushButton:hover {
-                border-color: #c86cff;
-                background: #25252d;
-            }
-            QPushButton#primary {
-                background: #8b3dcc;
-                border: none;
-            }
-            QPushButton#primary:hover {
-                background: #a451e5;
-            }
-            """
-        )
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(68, 48, 68, 46)
-        root.setSpacing(18)
-
-        title = QLabel("Who is playing?")
-        title.setObjectName("title")
-        title.setAlignment(Qt.AlignCenter)
-        root.addWidget(title)
-
-        hint = QLabel(
-            "Choose a saved player. For a new player, enter a name and then select a favourite emoji using the red marker."
-        )
-        hint.setObjectName("hint")
-        hint.setAlignment(Qt.AlignCenter)
-        hint.setWordWrap(True)
-        root.addWidget(hint)
-
-        self.player_list = QListWidget()
-        self.player_list.itemDoubleClicked.connect(lambda _item: self.play_selected())
-        root.addWidget(self.player_list, 1)
-
-        row = QHBoxLayout()
-        row.addStretch()
-
-        add_button = QPushButton("Add Player")
-        add_button.clicked.connect(self.add_player)
-        row.addWidget(add_button)
-
-        play_button = QPushButton("Play")
-        play_button.setObjectName("primary")
-        play_button.clicked.connect(self.play_selected)
-        row.addWidget(play_button)
-
-        quit_button = QPushButton("Quit")
-        quit_button.clicked.connect(self.quit_app)
-        row.addWidget(quit_button)
-
-        row.addStretch()
-        root.addLayout(row)
-
-        self.refresh_players()
-
-    def refresh_players(self):
-        self.player_list.clear()
-
-        for player in load_players():
-            rounds = player.get("rounds", [])
-            errors = []
-
-            for round_data in rounds:
-                value = round_data.get("telemetry", {}).get("final_error")
-                if isinstance(value, (int, float)):
-                    errors.append(value)
-
-            best = f"Best {int(min(errors))}px" if errors else "New player"
-
-            item = QListWidgetItem(
-                f"{player.get('emoji', '🙂')}   {player.get('name', 'Player')}"
-                f"      • {len(rounds)} attempts      • {best}"
-            )
-            item.setData(Qt.UserRole, player.get("id"))
-            self.player_list.addItem(item)
-
-        if self.player_list.count() > 0:
-            self.player_list.setCurrentRow(0)
-
-    def add_player(self):
-        dialog = QWidget(self)
-        dialog.setWindowTitle("New Player")
-        dialog.setMinimumWidth(450)
-        dialog.setStyleSheet(self.styleSheet())
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(28, 24, 28, 24)
-        layout.setSpacing(14)
-
-        label = QLabel("Player name")
-        layout.addWidget(label)
-
-        name_input = QLineEdit()
-        name_input.setPlaceholderText("Enter player name")
-        layout.addWidget(name_input)
-
-        info = QLabel(
-            "After this, point the physical red marker at one of 10 emojis and hold it there to select."
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet("color:#92929d;")
-        layout.addWidget(info)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch()
-
-        cancel = QPushButton("Cancel")
-        choose = QPushButton("Choose Emoji")
-        choose.setObjectName("primary")
-
-        buttons.addWidget(cancel)
-        buttons.addWidget(choose)
-        layout.addLayout(buttons)
-
-        loop = QEventLoop()
-        result = {"name": None}
-
-        def accept():
-            name = name_input.text().strip()
-            if not name:
-                QMessageBox.warning(dialog, "Name required", "Enter a player name first.")
-                return
-            result["name"] = name
-            dialog.close()
-            loop.quit()
-
-        def dismiss():
-            dialog.close()
-            loop.quit()
-
-        choose.clicked.connect(accept)
-        cancel.clicked.connect(dismiss)
-        name_input.returnPressed.connect(accept)
-
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-        name_input.setFocus()
-        loop.exec()
-
-        name = result["name"]
-        if not name:
-            return
-
-        # OpenCV camera takes over temporarily for physical marker selection.
-        self.hide()
-        QApplication.processEvents()
-
-        emoji = run_emoji_selector(name)
-
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-        if not emoji:
-            return
-
-        player = create_player(name, emoji)
-        self.refresh_players()
-
-        for index in range(self.player_list.count()):
-            item = self.player_list.item(index)
-            if item.data(Qt.UserRole) == player["id"]:
-                self.player_list.setCurrentRow(index)
-                break
-
-    def play_selected(self):
-        item = self.player_list.currentItem()
-        if not item:
-            QMessageBox.information(self, "No player", "Add or select a player first.")
-            return
-
-        player = get_player(item.data(Qt.UserRole))
-        if not player:
-            self.refresh_players()
-            return
-
-        self.selected_player = player
-        self.action = "PLAY"
-        self.close()
-
-        if self.loop.isRunning():
-            self.loop.quit()
-
-    def quit_app(self):
-        self.action = "QUIT"
-        self.close()
-        if self.loop.isRunning():
-            self.loop.quit()
-
-    def keyPressEvent(self, event):
-        if event.key() in (Qt.Key_Q, Qt.Key_Escape):
-            self.quit_app()
-            return
-        super().keyPressEvent(event)
-
-    def closeEvent(self, event):
-        if self.action is None:
-            self.action = "QUIT"
-        if self.loop.isRunning():
-            self.loop.quit()
-        event.accept()
-
-    def exec_player(self):
-        self.showFullScreen()
-        self.raise_()
-        self.activateWindow()
-        self.loop.exec()
-        return self.action, self.selected_player
-
-
-# ------------------------------------------------------------
-# Local Gemma 4 Oracle through Ollama
-# ------------------------------------------------------------
-
-class GeminiOracle:
-    """
-    Final Oracle analysis is generated by the LOCAL/LAN Gemma model:
-
-        Ollama:  http://192.168.11.157:11434
-        Model:   gemma4:e2b
-
-    The class name is intentionally kept as GeminiOracle so the existing
-    Qt/UI code does not need invasive changes.
-
-    Analysis flow:
-      1. Build a PRIVATE hidden-path image.
-      2. Send clean final frame + hidden-path image + telemetry to Ollama.
-      3. If the local model/server rejects image input, automatically retry
-         as a telemetry-only request instead of breaking the demo.
-      4. Display the Malayalam Oracle text in Qt.
-      5. Gemini Live still reads that Malayalam text aloud.
-    """
-
-    def __init__(self):
-        self.base_url = OLLAMA_BASE_URL
-        self.model = ORACLE_MODEL
-        self.lock = threading.Lock()
-
-        self.busy = False
-        self.status = "READY"
-        self.text = None
-        self.error = None
-        self.persona = None
-
-    def reset(self):
-        with self.lock:
-            self.busy = False
-            self.status = "READY"
-            self.text = None
-            self.error = None
-            self.persona = None
-
-    @staticmethod
-    def build_private_path_image(
-        clean_frame,
-        path_history,
-        target,
-    ):
-        """
-        PRIVATE ONLY. Never shown in the result UI.
-
-        Gemma sees:
-        - darkened camera frame
-        - glowing white trajectory
-        - cyan start
-        - red final point
-        - yellow target
-        """
-        diagnostic = clean_frame.copy()
-        black = np.zeros_like(diagnostic)
-
-        cv2.addWeighted(
-            diagnostic,
-            0.18,
-            black,
-            0.82,
-            0,
-            diagnostic,
-        )
-
-        if len(path_history) >= 2:
-            path = np.array(
-                path_history,
-                dtype=np.int32,
-            ).reshape((-1, 1, 2))
-
-            cv2.polylines(
-                diagnostic,
-                [path],
-                False,
-                (90, 90, 90),
-                11,
-                cv2.LINE_AA,
-            )
-
-            cv2.polylines(
-                diagnostic,
-                [path],
-                False,
-                (255, 255, 255),
-                4,
-                cv2.LINE_AA,
-            )
-
-        if path_history:
-            start = tuple(map(int, path_history[0]))
-            end = tuple(map(int, path_history[-1]))
-
-            cv2.circle(
-                diagnostic,
-                start,
-                9,
-                (255, 255, 0),
-                -1,
-            )
-
-            cv2.circle(
-                diagnostic,
-                end,
-                9,
-                (0, 0, 255),
-                -1,
-            )
-
-        if target:
-            cv2.circle(
-                diagnostic,
-                tuple(map(int, target)),
-                TARGET_TOLERANCE,
-                (0, 255, 255),
-                3,
-            )
-
-        return diagnostic
-
-    def start(
-        self,
-        clean_frame,
-        path_history,
-        target,
-        telemetry,
-    ):
-        with self.lock:
-            if self.busy:
-                return
-
-            self.busy = True
-            self.status = "GEMMA വിധി വായിക്കുന്നു..."
-            self.text = None
-            self.error = None
-
-        self.persona = random.choice(
-            ORACLE_PERSONAS
-        )
-
-        threading.Thread(
-            target=self._worker,
-            args=(
-                clean_frame.copy(),
-                list(path_history),
-                target,
-                dict(telemetry),
-                self.persona,
-            ),
-            daemon=True,
-        ).start()
-
-    @staticmethod
-    def _encode_jpeg_base64(frame, quality=90):
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            frame,
-            [
-                int(cv2.IMWRITE_JPEG_QUALITY),
-                int(quality),
-            ],
-        )
-
-        if not ok:
-            raise RuntimeError(
-                "Could not encode Oracle image"
-            )
-
-        return base64.b64encode(
-            encoded.tobytes()
-        ).decode("ascii")
-
-    def _ollama_chat(
-        self,
-        prompt,
-        images=None,
-        timeout=90,
-    ):
-        """Call Ollama /api/chat using only Python stdlib."""
-        message = {
-            "role": "user",
-            "content": prompt,
-        }
-
-        if images:
-            message["images"] = images
-
-        payload = {
-            "model": self.model,
-            "messages": [message],
-            "stream": False,
-            "options": {
-                "temperature": 1.0,
-            },
-        }
-
-        body = json.dumps(
-            payload,
-            ensure_ascii=False,
-        ).encode("utf-8")
-
-        request = urllib.request.Request(
-            f"{self.base_url}/api/chat",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(
-                request,
-                timeout=timeout,
-            ) as response:
-                raw = response.read().decode(
-                    "utf-8"
-                )
-
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode(
-                    "utf-8",
-                    errors="replace",
-                )
-            except Exception:
-                pass
-
-            raise RuntimeError(
-                f"Ollama HTTP {exc.code}: {detail}"
-            ) from exc
-
-        except urllib.error.URLError as exc:
-            raise RuntimeError(
-                f"Cannot reach Ollama at {self.base_url}: "
-                f"{exc.reason}"
-            ) from exc
-
-        data = json.loads(raw)
-
-        text = (
-            data.get("message", {})
-            .get("content", "")
-            .strip()
-        )
-
-        if not text:
-            raise RuntimeError(
-                "Ollama returned an empty Oracle response"
-            )
-
-        return text
-
-    def _worker(
-        self,
-        clean_frame,
-        path_history,
-        target,
-        telemetry,
-        persona,
-    ):
-        try:
-            diagnostic = self.build_private_path_image(
-                clean_frame,
-                path_history,
-                target,
-            )
-
-            recent = load_history()[-4:]
-
-            player_context = (
-                {
-                    "name": CURRENT_PLAYER.get("name"),
-                    "emoji": CURRENT_PLAYER.get("emoji"),
-                    "saved_attempts": len(CURRENT_PLAYER.get("rounds", [])),
-                }
-                if CURRENT_PLAYER
-                else {"name": "Player", "emoji": "🙂", "saved_attempts": 0}
-            )
-
-            prompt = f"""
-നിങ്ങൾ PottuAIയുടെ മലയാളം ഓണം ഓറക്കിൾ ആണ്.
-
-ഈ റൗണ്ടിലെ നിങ്ങളുടെ കഥാപാത്രം:
-{persona}
-
-ഇപ്പോഴത്തെ കളിക്കാരൻ:
-{json.dumps(player_context, ensure_ascii=False, indent=2)}
-
-ഇത് Sundarikk Pottu Thodal കളിയുടെ ഒരു പൂർത്തിയായ ശ്രമമാണ്.
-
-ചിത്രങ്ങൾ ലഭിച്ചിട്ടുണ്ടെങ്കിൽ:
-1. ആദ്യ ചിത്രം = target എത്തിയ നിമിഷത്തിലെ clean final camera frame.
-2. രണ്ടാം PRIVATE analysis image:
-   - glowing white line = കളിക്കാരന്റെ മുഴുവൻ കൈയാത്ര
-   - yellow circle = forehead target
-   - cyan point = start
-   - red point = final position
-
-ഈ locally measured values ആണ് ground truth:
-{json.dumps(telemetry, ensure_ascii=False, indent=2)}
-
-ഈ ഉപകരണത്തിലെ സമീപകാല ശ്രമങ്ങൾ:
-{json.dumps(recent, ensure_ascii=False, indent=2)}
-
-നിങ്ങളുടെ ജോലി:
-- കൈയാത്ര നേരെയാണോ, വളഞ്ഞതാണോ, shaky ആണോ, zig-zag ആണോ,
-  വലിയ detour ഉണ്ടോ, അവസാന panic correction ഉണ്ടോ, controlled ആണോ എന്ന് വിലയിരുത്തുക.
-- ചിത്രങ്ങൾ ലഭിച്ചിട്ടുണ്ടെങ്കിൽ path shape നേരിട്ട് പരിശോധിക്കുക.
-- ചിത്രങ്ങൾ ലഭ്യമല്ലെങ്കിൽ telemetry, path efficiency, direction reversals,
-  completion time, command counts എന്നിവ മാത്രം ആശ്രയിക്കുക.
-- ground truth ന് വിരുദ്ധമായ claim പറയരുത്.
-
-അവസാന Oracle output:
-- മലയാളത്തിൽ മാത്രം.
-- ഒരു continuous paragraph മാത്രം.
-- heading ഇല്ല.
-- bullets ഇല്ല.
-- JSON ഇല്ല.
-- 3 മുതൽ 5 വരെ sentences.
-- ഏകദേശം 55 മുതൽ 90 വരെ മലയാളം words.
-- witty + dramatic + mystical + sarcastic tone.
-- playful teasing മാത്രം; insult ചെയ്യരുത്.
-- മഹാബലിയെ സ്വാഭാവികമായി ഉൾപ്പെടുത്തുക.
-- ഓരോ റൗണ്ടിലും wording വ്യത്യസ്തമാക്കുക.
-- previous attempt ഉണ്ടെങ്കിൽ പ്രസക്തമായ ഒരു മാറ്റം മാത്രം പറയാം.
-- exact technical measurements പറയേണ്ടതില്ല.
-- "AI", "Gemini", "Gemma", "pixel", "telemetry" എന്നീ technical words ഉപയോഗിക്കരുത്.
-- യഥാർത്ഥ supernatural certainty claim ചെയ്യരുത്.
-- movement patternനോട് ബന്ധപ്പെട്ട ഒരു fun future-style prediction നൽകുക.
-
-Output = Malayalam horoscope paragraph മാത്രം.
-""".strip()
-
-            # First choice: multimodal local Gemma through Ollama.
-            clean_b64 = self._encode_jpeg_base64(
-                clean_frame,
-                quality=86,
-            )
-            path_b64 = self._encode_jpeg_base64(
-                diagnostic,
-                quality=90,
-            )
-
-            try:
-                text = self._ollama_chat(
-                    prompt,
-                    images=[
-                        clean_b64,
-                        path_b64,
-                    ],
-                    timeout=120,
-                )
-
-                mode = "MULTIMODAL"
-
-            except Exception as image_error:
-                # Some Ollama/model combinations may reject images.
-                # Do not fail the whole Oracle screen: retry text-only.
-                print(
-                    "Gemma multimodal request failed; "
-                    "retrying telemetry-only: "
-                    f"{image_error}"
-                )
-
-                text_only_prompt = (
-                    prompt
-                    + "\n\nIMPORTANT: ഈ requestൽ images ലഭ്യമല്ല. "
-                    "മുകളിൽ നൽകിയ deterministic telemetry മാത്രം "
-                    "ആശ്രയിച്ച് Oracle paragraph തയ്യാറാക്കുക."
-                )
-
-                text = self._ollama_chat(
-                    text_only_prompt,
-                    images=None,
-                    timeout=120,
-                )
-
-                mode = "TELEMETRY"
-
-            text = (
-                text.strip()
-                .strip('"')
-                .strip("“")
-                .strip("”")
-            )
-
-            with self.lock:
-                self.text = text
-                self.status = (
-                    "LOCAL GEMMA ഓറക്കിൾ സംസാരിച്ചു"
-                )
-
-            save_history(
-                telemetry,
-                text,
-                persona,
-            )
-
-            print()
-            print(
-                "========== LOCAL GEMMA ORACLE =========="
-            )
-            print(
-                f"Server: {self.base_url}"
-            )
-            print(
-                f"Model: {self.model} | Mode: {mode}"
-            )
-            print(text)
-            print(
-                "========================================"
-            )
-            print()
-
-            # Read the LOCAL Gemma-generated Malayalam paragraph aloud
-            # through the existing Gemini Live voice layer.
-            live_voice.speak_oracle(
-                text
-            )
-
-        except Exception as exc:
-            print(
-                "Local Gemma Oracle error: "
-                f"{exc}"
-            )
-
-            fallback = self._fallback(
-                telemetry
-            )
-
-            with self.lock:
-                self.error = str(exc)
-                self.text = fallback
-                self.status = (
-                    "LOCAL GEMMA OFFLINE"
-                )
-
-            # Preserve the demo even if the LAN/Ollama machine is down.
-            live_voice.speak_oracle(
-                fallback
-            )
-
-        finally:
-            with self.lock:
-                self.busy = False
-
-    @staticmethod
-    def _fallback(
-        telemetry,
-    ):
-        reversals = telemetry.get(
-            "direction_reversals",
-            0,
-        )
-
-        efficiency = telemetry.get(
-            "path_efficiency",
-            0,
-        )
-
-        if (
-            efficiency >= 0.78
-            and reversals <= 2
-        ):
-            return (
-                "നിന്റെ കൈ ഇന്ന് സംശയങ്ങൾക്ക് സമയം കൊടുക്കാതെ "
-                "നേരെ ലക്ഷ്യത്തിലേക്ക് നീങ്ങിയതാണ് കാണുന്നത്. "
-                "ഇതേ ശാന്തത തുടരുകയാണെങ്കിൽ അടുത്ത വെല്ലുവിളിയിലും "
-                "അവസാന നിമിഷം നിന്റെ പക്ഷത്തായിരിക്കും. "
-                "മഹാബലി പോലും ഈ ആത്മവിശ്വാസം കണ്ടിട്ട് "
-                "രഹസ്യം ചോദിക്കാതെ ഒരു ചിരിയോടെ കടന്നുപോകും."
-            )
-
-        if reversals >= 5:
-            return (
-                "നിന്റെ കൈ ലക്ഷ്യം കണ്ടെത്തുന്നതിന് മുമ്പ് "
-                "സ്വന്തമായി ഒരു ചെറിയ ഓണം യാത്ര നടത്തിയതുപോലെ തോന്നുന്നു. "
-                "വളവും തിരിവും ഉണ്ടായിട്ടും അവസാനം ശരിയായ സ്ഥലം "
-                "കണ്ടെത്തിയത് നിന്റെ പ്രത്യേക കഴിവാണ്. "
-                "അടുത്ത തവണ അല്പം കുറച്ച് സംശയിച്ചാൽ വിജയം "
-                "കൂടുതൽ വേഗം എത്തും; മഹാബലി ഇതിനകം നിനക്കായി "
-                "ഒരു ഭൂപടം കരുതിയിരിക്കാം."
-            )
-
-        return (
-            "നിന്റെ കൈയുടെ യാത്ര ആദ്യം അല്പം സംശയിച്ചെങ്കിലും "
-            "അവസാനത്തിൽ ലക്ഷ്യവുമായി നല്ലൊരു ധാരണയിലെത്തി. "
-            "ഇങ്ങനെ അവസാന നിമിഷം ശാന്തമായി നിയന്ത്രിക്കാൻ കഴിഞ്ഞാൽ "
-            "അടുത്ത വെല്ലുവിളിയും നിനക്ക് അനുകൂലമായി തീരാൻ സാധ്യതയുണ്ട്. "
-            "മഹാബലി ഈ നീക്കം ശ്രദ്ധിച്ചിട്ടുണ്ടാകും, പക്ഷേ "
-            "നിന്റെ രഹസ്യം ഇപ്പോൾ സുരക്ഷിതമാണ്."
-        )
-
-
-oracle = GeminiOracle()
-
-
-# ------------------------------------------------------------
-# Vision helpers
-# ------------------------------------------------------------
-
-def load_face_detector():
-    candidates = [
-        (
-            "/usr/share/opencv4/"
-            "haarcascades/"
-            "haarcascade_frontalface_default.xml"
-        ),
-        (
-            cv2.data.haarcascades
-            + "haarcascade_frontalface_default.xml"
-        ),
-    ]
-
-    for path in candidates:
-        if (
-            path
-            and os.path.exists(path)
-        ):
-            detector = (
-                cv2.CascadeClassifier(
-                    path
-                )
-            )
-
-            if not detector.empty():
-                print(
-                    "Face detector: "
-                    f"{path}"
-                )
-
-                return detector
-
-    raise RuntimeError(
-        "Could not load "
-        "Haar face detector"
-    )
-
-
-def detect_red_marker(
-    frame,
-):
-    hsv = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2HSV,
-    )
-
-    lower_1 = np.array(
-        [0, 120, 70],
-        dtype=np.uint8,
-    )
-
-    upper_1 = np.array(
-        [10, 255, 255],
-        dtype=np.uint8,
-    )
-
-    lower_2 = np.array(
-        [170, 120, 70],
-        dtype=np.uint8,
-    )
-
-    upper_2 = np.array(
-        [180, 255, 255],
-        dtype=np.uint8,
-    )
-
-    mask = cv2.inRange(
-        hsv,
-        lower_1,
-        upper_1,
-    )
-
-    mask = cv2.bitwise_or(
-        mask,
-        cv2.inRange(
-            hsv,
-            lower_2,
-            upper_2,
-        ),
-    )
-
-    kernel = np.ones(
-        (5, 5),
-        dtype=np.uint8,
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        kernel,
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        kernel,
-    )
-
-    contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
-    )
-
-    best = None
-    best_area = 0.0
-
-    for contour in contours:
-        area = cv2.contourArea(
-            contour
-        )
-
-        if (
-            area < RED_MIN_AREA
-            or area <= best_area
-        ):
-            continue
-
-        moments = cv2.moments(
-            contour
-        )
-
-        if moments["m00"] == 0:
-            continue
-
-        x = int(
-            moments["m10"]
-            / moments["m00"]
-        )
-
-        y = int(
-            moments["m01"]
-            / moments["m00"]
-        )
-
-        best = (
-            x,
-            y,
-        )
-
-        best_area = area
-
-    return best
-
-
-def verified_direction(
-    dx,
-    dy,
-    distance,
-):
-    if (
-        distance
-        <= TARGET_TOLERANCE
-    ):
-        return "STOP"
-
-    if (
-        abs(dx)
-        <= AXIS_TOLERANCE
-        and abs(dy)
-        > AXIS_TOLERANCE
-    ):
-        return (
-            "DOWN"
-            if dy > 0
-            else "UP"
-        )
-
-    if (
-        abs(dy)
-        <= AXIS_TOLERANCE
-        and abs(dx)
-        > AXIS_TOLERANCE
-    ):
-        return (
-            "RIGHT"
-            if dx > 0
-            else "LEFT"
-        )
-
-    if abs(dx) >= abs(dy):
-        return (
-            "RIGHT"
-            if dx > 0
-            else "LEFT"
-        )
-
-    return (
-        "DOWN"
-        if dy > 0
-        else "UP"
-    )
-
-
-def add_path_point(
-    path,
-    point,
-):
-    if not path:
-        path.append(point)
-        return
-
-    x1, y1 = path[-1]
-    x2, y2 = point
-
-    if (
-        math.hypot(
-            x2 - x1,
-            y2 - y1,
-        )
-        > PATH_SAMPLE_DISTANCE
-    ):
-        path.append(point)
-
-
-def path_length(
-    path,
-):
-    total = 0.0
-
-    for index in range(
-        1,
-        len(path),
-    ):
-        x1, y1 = path[
-            index - 1
-        ]
-
-        x2, y2 = path[
-            index
-        ]
-
-        total += math.hypot(
-            x2 - x1,
-            y2 - y1,
-        )
-
-    return total
-
-
-def direction_reversals(
-    commands,
-):
-    opposite = {
-        (
-            "LEFT",
-            "RIGHT",
-        ),
-        (
-            "RIGHT",
-            "LEFT",
-        ),
-        (
-            "UP",
-            "DOWN",
-        ),
-        (
-            "DOWN",
-            "UP",
-        ),
-    }
-
-    total = 0
-
-    for index in range(
-        1,
-        len(commands),
-    ):
-        if (
-            commands[
-                index - 1
-            ],
-            commands[
-                index
-            ],
-        ) in opposite:
-            total += 1
-
-    return total
-
-
-def make_telemetry(
-    path,
-    commands,
-    command_counts,
-    target,
-    final_error,
-    completion_time,
-):
-    travelled = path_length(
-        path
-    )
-
-    if path:
-        direct = math.hypot(
-            target[0]
-            - path[0][0],
-            target[1]
-            - path[0][1],
-        )
-
-    else:
-        direct = 0.0
-
-    efficiency = (
-        direct / travelled
-        if travelled > 0
-        else 0.0
-    )
-
-    efficiency = max(
-        0.0,
-        min(
-            1.0,
-            efficiency,
-        ),
-    )
-
-    return {
-        "player_id": CURRENT_PLAYER.get("id") if CURRENT_PLAYER else None,
-        "player_name": CURRENT_PLAYER.get("name") if CURRENT_PLAYER else "Player",
-        "player_emoji": CURRENT_PLAYER.get("emoji") if CURRENT_PLAYER else "🙂",
-        "final_error": int(
-            final_error
-        ),
-        "completion_time_seconds": round(
-            completion_time,
-            2,
-        ),
-        "sampled_path_points": len(
-            path
-        ),
-        "path_length": round(
-            travelled,
-            1,
-        ),
-        "direct_start_to_target_distance": round(
-            direct,
-            1,
-        ),
-        "path_efficiency": round(
-            efficiency,
-            3,
-        ),
-        "direction_reversals": (
-            direction_reversals(
-                commands
-            )
-        ),
-        "command_counts": dict(
-            command_counts
-        ),
-    }
-
-
-# ------------------------------------------------------------
-# Convert OpenCV frame -> QPixmap
-# ------------------------------------------------------------
-
-def frame_to_pixmap(
-    frame,
-):
-    rgb = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2RGB,
-    )
-
-    height, width, channels = (
-        rgb.shape
-    )
-
-    bytes_per_line = (
-        channels * width
-    )
-
-    image = QImage(
-        rgb.data,
-        width,
-        height,
-        bytes_per_line,
-        QImage.Format_RGB888,
-    ).copy()
-
-    return QPixmap.fromImage(
-        image
-    )
-
-
-# ------------------------------------------------------------
-# Qt Oracle UI
-# ------------------------------------------------------------
 
 class OracleWindow(
     QWidget

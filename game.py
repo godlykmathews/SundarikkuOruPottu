@@ -135,11 +135,11 @@ PLAYER_FILE = Path(
 )
 
 PLAYER_EMOJIS = [
-    "🎯",
-    "🔥",
-    "🌸",
-    "👑",
-    "⚡",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
 ]
 
 # Camera player selection:
@@ -1505,7 +1505,11 @@ def _draw_emojis_qt(
     )
 
     font = QFont(
-        "Noto Color Emoji"
+        "DejaVu Sans"
+    )
+
+    font.setBold(
+        True
     )
 
     font.setPixelSize(
@@ -1776,7 +1780,7 @@ def run_camera_player_selector():
 
             cv2.putText(
                 frame,
-                "KEEP THE RED MARKER ON YOUR EMOJI FOR 3 SECONDS",
+                "KEEP THE RED MARKER ON YOUR LETTER FOR 3 SECONDS",
                 (
                     24,
                     42,
@@ -3039,10 +3043,10 @@ class OracleWindow(
         player_emoji = (
             CURRENT_PLAYER.get(
                 "emoji",
-                "🙂",
+                "A",
             )
             if CURRENT_PLAYER
-            else "🙂"
+            else "A"
         )
 
         player_attempts = (

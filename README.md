@@ -2,9 +2,12 @@
 
 PottuAI is a camera-based Onam game that guides a red marker toward a player's forehead and turns the completed hand path into a playful Malayalam horoscope.
 
-The current application is implemented in `pottuai.py`. OpenCV handles gameplay, Gemini Live provides cached Malayalam direction audio, Gemini generates the final Oracle reading, and PySide6 displays the result in a full-screen Malayalam UI. An optional ESP32 can receive the same movement commands over USB serial.
+The current application is implemented in `pottu_ai.py`. OpenCV handles gameplay, local/LAN Gemma 4 generates the Oracle reading through Ollama, Gemini Live provides Malayalam speech, and PySide6 displays the result in a full-screen Malayalam UI. An optional ESP32 can receive the same movement commands over USB serial.
 
-The configured models are `gemini-3.1-flash-live-preview` for Malayalam audio and `gemini-3.7-flash` for the multimodal Oracle reading.
+The configured models and responsibilities are:
+
+- `gemma4:e2b` through Ollama: multimodal Malayalam horoscope generation, with an automatic telemetry-only retry if image input fails.
+- `gemini-3.1-flash-live-preview`: Malayalam direction clips and spoken narration of the Gemma-generated horoscope.
 
 ## Features
 
@@ -16,8 +19,9 @@ The configured models are `gemini-3.1-flash-live-preview` for Malayalam audio an
 - Uses Gemini Live to generate Malayalam direction clips and caches them locally for low-latency playback.
 - Records the marker path internally without displaying the trajectory during gameplay.
 - Measures completion time, path length, path efficiency, command counts, and direction reversals.
-- Sends the clean final frame, a private path visualization, telemetry, and recent results to Gemini for a unique Malayalam horoscope.
-- Reads the horoscope aloud and displays it in a full-screen PySide6 result window.
+- Sends the clean final frame, a private path visualization, telemetry, and recent results to Gemma 4 through Ollama for a unique Malayalam horoscope.
+- Automatically retries Gemma with telemetry only if the Ollama model rejects image input.
+- Uses Gemini Live to read the Gemma-generated horoscope aloud, then displays it in a full-screen PySide6 result window.
 - Keeps up to six recent readings in a local JSON history file.
 - Supports replaying another round without restarting the application.
 
@@ -32,23 +36,29 @@ USB camera
                                       |
 target + marker --> verified direction + path telemetry
                          |                    |
-                         |                    +--> Gemini Oracle
+                         |                    +--> Ollama / Gemma 4
+                         |                         + clean final frame
                          |                         + private path image
+                         |                         + recent history
                          |                         + Malayalam horoscope
-                         |                         + PySide6 result UI
+                         |                                  |
+                         |                                  +--> PySide6 result UI
+                         |                                  +--> Gemini Live narration
                          |
-                         +--> cached Gemini Malayalam audio
+                         +--> cached Gemini Live direction audio
                          +--> optional ESP32 command over serial
 ```
 
-The camera and OpenCV window are closed before the Oracle result window opens. The marker trajectory is never drawn on the public gameplay or result view; it is rendered only into the private diagnostic image used for the Oracle request.
+The camera and OpenCV window are closed before the Oracle result window opens. The marker trajectory is never drawn on the public gameplay or result view; it is rendered only into the private diagnostic image sent to the configured Ollama server.
 
 ## Requirements
 
 - Python 3.10 or newer
 - A USB camera
-- A Gemini API key
-- An internet connection for initial direction-audio generation and each Oracle reading
+- An Ollama server with the `gemma4:e2b` model, running locally or on the same network
+- A Gemini API key for Malayalam speech generation
+- An internet connection when Gemini Live needs to generate direction audio or Oracle narration
+- Network access from PottuAI to the configured Ollama server
 - `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA) for spoken audio
 - A Malayalam font, preferably Noto Sans Malayalam
 - Optional: an ESP32 connected over USB serial
@@ -77,22 +87,43 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Set the Gemini API key and start the app:
+## Gemma 4 and Ollama setup
+
+On the computer that will run Gemma 4, install Ollama and make sure the model configured by `pottu_ai.py` is available:
+
+```bash
+ollama pull gemma4:e2b
+ollama serve
+```
+
+The application calls Ollama's `/api/chat` endpoint directly, so it does not require an additional Python Ollama package. By default it connects to:
+
+```text
+http://192.168.11.157:11434
+```
+
+If Ollama is on another computer, configure Ollama to accept LAN connections and ensure port `11434` is reachable. Point PottuAI to the correct server with `POTTU_OLLAMA_URL`.
+
+## Run PottuAI
+
+Set the Gemini API key and, when necessary, override the Ollama URL:
 
 ```bash
 export GEMINI_API_KEY="your-api-key"
-python pottuai.py
+export POTTU_OLLAMA_URL="http://192.168.11.157:11434"
+python pottu_ai.py
 ```
 
 On the first run, PottuAI asks Gemini Live to create five short Malayalam direction clips. It stores the raw PCM files in `.pottuai_gemini_audio/` and reuses them on later runs.
 
 ## Configuration
 
-All configuration is optional except `GEMINI_API_KEY` for Gemini voice and Oracle generation.
+Gemma horoscope generation and Gemini speech are independent. `POTTU_OLLAMA_URL` selects the Gemma server, while `GEMINI_API_KEY` enables speech.
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | unset | Enables Gemini direction audio and Oracle generation. |
+| `GEMINI_API_KEY` | unset | Enables Gemini Live direction audio and Oracle narration. |
+| `POTTU_OLLAMA_URL` | `http://192.168.11.157:11434` | Ollama base URL used for the Gemma 4 Oracle request. |
 | `POTTU_CAMERA` | `0` | OpenCV camera index. |
 | `POTTU_SERIAL_PORT` | unset | ESP32 device, such as `/dev/ttyUSB0`; serial is disabled when unset. |
 | `POTTU_TARGET_TOLERANCE` | `30` | Target radius in pixels at which `STOP` is issued. |
@@ -108,8 +139,9 @@ Example:
 ```bash
 POTTU_CAMERA=1 \
 POTTU_SERIAL_PORT=/dev/ttyACM0 \
+POTTU_OLLAMA_URL=http://192.168.11.157:11434 \
 POTTU_AUDIO_SINK=bluez_output.YOUR_DEVICE_NAME \
-python pottuai.py
+python pottu_ai.py
 ```
 
 ## Gameplay and controls
@@ -125,7 +157,7 @@ Controls:
 - `R` restarts from the result window after the Oracle response is ready.
 - The Malayalam buttons in the result window restart or exit the app.
 
-If Gemini generation fails or the API key is missing, the result UI uses a deterministic Malayalam fallback horoscope. Spoken guidance requires either previously cached direction clips or a valid API key; Oracle narration requires a valid API key and a successful audio response.
+Gemma first receives both images and the measured telemetry. If that multimodal request fails, PottuAI retries the same model using telemetry only. If the Ollama server or both Gemma requests fail, the result UI uses a deterministic Malayalam fallback horoscope. Spoken guidance requires either previously cached direction clips or a valid Gemini API key; narration requires a valid key and a successful Gemini Live audio response.
 
 ## ESP32 serial integration
 
@@ -164,16 +196,16 @@ Select a particular sink with `POTTU_AUDIO_SINK` if multiple Bluetooth devices a
 
 ```text
 .
-├── pottuai.py          # Current Oracle Edition application
+├── pottu_ai.py         # Current Gemma + Gemini Oracle Edition application
 ├── requirements.txt    # Runtime Python dependencies
 ├── images/             # Prototype development photos
-├── models/             # Earlier face-model resources (not used by pottuai.py)
+├── models/             # Earlier face-model resources (not used by pottu_ai.py)
 └── archive/            # Previous application iterations
 ```
 
 ## Troubleshooting
 
-If the camera cannot open, verify the index with `POTTU_CAMERA` and make sure no other program is using it. On Linux, `pottuai.py` opens the camera through V4L2.
+If the camera cannot open, verify the index with `POTTU_CAMERA` and make sure no other program is using it. On Linux, `pottu_ai.py` opens the camera through V4L2.
 
 If `cv2.CascadeClassifier` or `cv2.imshow` is unavailable, remove conflicting or headless OpenCV distributions and reinstall the requirements:
 
@@ -189,6 +221,14 @@ python -c "import cv2; print(cv2.__version__, cv2.CascadeClassifier)"
 ```
 
 If Malayalam text renders as boxes, install the Noto font packages above and restart the application. If no sound is heard, confirm that either `paplay` or `aplay` is installed and test the selected sink outside PottuAI.
+
+If the Oracle status shows `LOCAL GEMMA OFFLINE`, verify the Ollama server and model from the PottuAI machine:
+
+```bash
+curl http://192.168.11.157:11434/api/tags
+```
+
+Replace the address with `POTTU_OLLAMA_URL` when using a different host. Confirm that `gemma4:e2b` is listed and that the Ollama host permits connections from the Raspberry Pi.
 
 ## Development photos
 

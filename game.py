@@ -4084,7 +4084,12 @@ def run_game_round(
 
     last_counted = None
 
-    started_at = time.monotonic()
+    # Post-win UI must never use the final frame because the player's hand
+    # and pen are at the forehead then. Capture a clean portrait first, before
+    # guidance or timing begins, and reuse it for every public result screen.
+    portrait_frame = None
+    portrait_target = None
+    started_at = None
 
     try:
         while cap.isOpened():
@@ -4164,14 +4169,15 @@ def run_game_round(
                 )
 
             marker = detect_red_marker(
-                frame
+                clean_frame
             )
 
             if marker:
-                add_path_point(
-                    path_history,
-                    marker,
-                )
+                if portrait_frame is not None:
+                    add_path_point(
+                        path_history,
+                        marker,
+                    )
 
                 # Current marker only.
                 # NO path is drawn.
@@ -4186,6 +4192,57 @@ def run_game_round(
                     ),
                     -1,
                 )
+
+            if portrait_frame is None:
+                if target and marker is None:
+                    portrait_frame = clean_frame.copy()
+                    portrait_target = target
+                    started_at = time.monotonic()
+
+                    cv2.putText(
+                        frame,
+                        "CLEAN FACE CAPTURED - BRING THE RED MARKER",
+                        (20, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.62,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                else:
+                    cv2.putText(
+                        frame,
+                        "REMOVE THE RED PEN FOR A CLEAN FACE SNAPSHOT",
+                        (20, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.58,
+                        (0, 210, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                cv2.putText(
+                    frame,
+                    "GUIDANCE STARTS AFTER THE CLEAN SNAPSHOT",
+                    (20, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+                cv2.imshow(
+                    WINDOW_NAME,
+                    frame,
+                )
+
+                key = cv2.waitKey(1) & 0xFF
+
+                if key in (ord("q"), 27):
+                    return {"quit": True}
+
+                continue
 
             if (
                 target
@@ -4329,6 +4386,32 @@ def run_game_round(
 
                     final_error = distance
 
+                    # Preserve the player's true final offset while moving it
+                    # onto the clean pre-game portrait. This keeps the result
+                    # faithful without showing the hand, pen, or red marker.
+                    placement_offset = (
+                        marker[0] - target[0],
+                        marker[1] - target[1],
+                    )
+                    portrait_pottu_position = (
+                        max(
+                            0,
+                            min(
+                                portrait_frame.shape[1] - 1,
+                                portrait_target[0]
+                                + placement_offset[0],
+                            ),
+                        ),
+                        max(
+                            0,
+                            min(
+                                portrait_frame.shape[0] - 1,
+                                portrait_target[1]
+                                + placement_offset[1],
+                            ),
+                        ),
+                    )
+
                     telemetry = (
                         make_telemetry(
                             path_history,
@@ -4340,8 +4423,8 @@ def run_game_round(
                         )
                     )
 
-                    # Keep clean frame with no OpenCV debug overlays
-                    # for the cinematic Qt result background.
+                    # Keep the real final frame for private Oracle analysis.
+                    # Public result screens use the earlier clean portrait.
                     frozen_clean_frame = (
                         clean_frame.copy()
                     )
@@ -4372,7 +4455,7 @@ def run_game_round(
                         "Camera closed."
                     )
                     print(
-                        "Opening Qt Oracle UI..."
+                        "Opening clean portrait success pipeline..."
                     )
                     print()
 
@@ -4382,7 +4465,8 @@ def run_game_round(
                             path_history
                         ),
                         "target": target,
-                        "pottu_position": marker,
+                        "portrait_frame": portrait_frame,
+                        "pottu_position": portrait_pottu_position,
                         "telemetry": telemetry,
                     }
 
@@ -4606,7 +4690,7 @@ def main():
             # First show the successful portrait with a digital pottu placed
             # exactly where the final red marker was detected.
             capture_window = PottuCaptureWindow(
-                round_data["frame"],
+                round_data["portrait_frame"],
                 round_data["pottu_position"],
             )
             capture_window.exec_capture()
@@ -4618,7 +4702,7 @@ def main():
             # finish cleanly. Oracle speech starts only after its result UI is
             # visible, so it cannot overlap the win sound.
             celebration_window = CelebrationWindow(
-                round_data["frame"]
+                round_data["portrait_frame"]
             )
             celebration_window.exec_celebration()
             celebration_window.deleteLater()
@@ -4627,7 +4711,7 @@ def main():
             result_window = (
                 OracleWindow(
                     round_data[
-                        "frame"
+                        "portrait_frame"
                     ]
                 )
             )

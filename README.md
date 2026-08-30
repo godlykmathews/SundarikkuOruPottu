@@ -2,7 +2,7 @@
 
 PottuAI is a camera-based Onam game that guides a red marker toward a player's forehead and turns the completed hand path into a playful Malayalam horoscope.
 
-The current application is implemented in `pottu_ai.py`. OpenCV handles gameplay, local/LAN Gemma 4 generates the Oracle reading through Ollama, Gemini Live provides Malayalam speech, and PySide6 displays the result in a full-screen Malayalam UI. An optional ESP32 can receive the same movement commands over USB serial.
+The current application is implemented in `game.py`. OpenCV handles player selection and gameplay, local/LAN Gemma 4 generates the Oracle reading through Ollama, Gemini Live provides Malayalam speech, and PySide6 displays the celebration and result screens. An optional ESP32 can receive the same movement commands over USB serial.
 
 The configured models and responsibilities are:
 
@@ -16,19 +16,24 @@ The configured models and responsibilities are:
 - Tracks a saturated red marker in HSV colour space.
 - Generates `LEFT`, `RIGHT`, `UP`, `DOWN`, and `STOP` commands.
 - Sends changed commands to an optional ESP32 at `115200` baud.
+- Provides five persistent player slots labelled `A`, `B`, `C`, `D`, and `E`, selected by holding the red marker over a letter for three seconds.
+- Stores attempts and Oracle history separately for each player and displays a persistent accuracy leaderboard.
 - Uses Gemini Live to generate Malayalam direction clips and caches them locally for low-latency playback.
 - Records the marker path internally without displaying the trajectory during gameplay.
 - Measures completion time, path length, path efficiency, command counts, and direction reversals.
 - Sends the clean final frame, a private path visualization, telemetry, and recent results to Gemma 4 through Ollama for a unique Malayalam horoscope.
 - Automatically retries Gemma with telemetry only if the Ollama model rejects image input.
-- Uses Gemini Live to read the Gemma-generated horoscope aloud, then displays it in a full-screen PySide6 result window.
-- Keeps up to six recent readings in a local JSON history file.
-- Supports replaying another round without restarting the application.
+- Randomly plays one local win sound and displays a full-screen congratulations screen for at least five seconds after reaching the target.
+- Generates the Oracle while the celebration is visible, then displays and narrates it in a full-screen PySide6 result window.
+- Cancels superseded playback and background narration so audio from an earlier round cannot leak into a new round.
+- Supports replaying as the same player or returning to the camera-based player selector without restarting the application.
 
 ## How it works
 
 ```text
 USB camera
+    |
+    +--> red-marker hold selector --> player A / B / C / D / E
     |
     +--> Haar face detection --> forehead target
     |
@@ -47,9 +52,16 @@ target + marker --> verified direction + path telemetry
                          |
                          +--> cached Gemini Live direction audio
                          +--> optional ESP32 command over serial
+
+target reached --> stop guidance audio + close camera
+                         |
+                         +--> random audio/win1..win4 sound
+                         +--> congratulations screen (minimum 5 seconds)
+                                      |
+                                      +--> Oracle result UI
 ```
 
-The camera and OpenCV window are closed before the Oracle result window opens. The marker trajectory is never drawn on the public gameplay or result view; it is rendered only into the private diagnostic image sent to the configured Ollama server.
+The camera and OpenCV window are closed before the celebration and Oracle windows open. The marker trajectory is never drawn on the public gameplay, celebration, or result view; it is rendered only into the private diagnostic image sent to the configured Ollama server. Oracle generation runs during the celebration to reduce waiting, but narration does not start until the new Oracle text is visible.
 
 ## Requirements
 
@@ -60,6 +72,7 @@ The camera and OpenCV window are closed before the Oracle result window opens. T
 - An internet connection when Gemini Live needs to generate direction audio or Oracle narration
 - Network access from PottuAI to the configured Ollama server
 - `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA) for spoken audio
+- Qt Multimedia support from PySide6 for MP3/WAV celebration playback
 - A Malayalam font, preferably Noto Sans Malayalam
 - Optional: an ESP32 connected over USB serial
 
@@ -89,7 +102,7 @@ python -m pip install -r requirements.txt
 
 ## Gemma 4 and Ollama setup
 
-On the computer that will run Gemma 4, install Ollama and make sure the model configured by `pottu_ai.py` is available:
+On the computer that will run Gemma 4, install Ollama and make sure the model configured by `game.py` is available:
 
 ```bash
 ollama pull gemma4:e2b
@@ -111,7 +124,7 @@ Set the Gemini API key and, when necessary, override the Ollama URL:
 ```bash
 export GEMINI_API_KEY="your-api-key"
 export POTTU_OLLAMA_URL="http://192.168.11.157:11434"
-python pottu_ai.py
+python game.py
 ```
 
 On the first run, PottuAI asks Gemini Live to create five short Malayalam direction clips. It stores the raw PCM files in `.pottuai_gemini_audio/` and reuses them on later runs.
@@ -132,7 +145,8 @@ Gemma horoscope generation and Gemini speech are independent. `POTTU_OLLAMA_URL`
 | `POTTU_RED_MIN_AREA` | `500` | Minimum accepted red contour area in pixels. |
 | `POTTU_AUDIO_SINK` | automatic | PulseAudio/PipeWire sink name; useful for selecting a Bluetooth device. |
 | `POTTU_GEMINI_AUDIO_CACHE` | `.pottuai_gemini_audio` | Directory for cached 24 kHz mono PCM direction clips. |
-| `POTTU_HISTORY_FILE` | `pottuai_history.json` | JSON file that stores the six most recent Oracle results. |
+| `POTTU_PLAYER_FILE` | `pottuai_players.json` | Persistent player attempts, leaderboard data, and player-specific Oracle history. |
+| `POTTU_EMOJI_HOLD_SECONDS` | `3.0` | Seconds the red marker must remain over a player letter. The legacy variable name is retained for compatibility. |
 
 Example:
 
@@ -141,21 +155,23 @@ POTTU_CAMERA=1 \
 POTTU_SERIAL_PORT=/dev/ttyACM0 \
 POTTU_OLLAMA_URL=http://192.168.11.157:11434 \
 POTTU_AUDIO_SINK=bluez_output.YOUR_DEVICE_NAME \
-python pottu_ai.py
+python game.py
 ```
 
 ## Gameplay and controls
 
-1. Keep one face clearly visible to the camera.
-2. Move a sufficiently large, saturated red marker toward the yellow forehead target.
-3. Follow the English on-screen command or the spoken Malayalam direction.
-4. When the marker enters the target radius, the app sends `STOP`, closes the camera view, and opens the Oracle result.
+1. Hold the red marker over player letter `A`, `B`, `C`, `D`, or `E` for three seconds.
+2. Keep one face clearly visible to the camera.
+3. Move a sufficiently large, saturated red marker toward the yellow forehead target.
+4. Follow the English on-screen command or the spoken Malayalam direction.
+5. When the marker enters the target radius, the app sends `STOP`, stops guidance audio, and closes the camera view.
+6. A congratulations screen plays one randomly selected win sound. It remains visible for at least five seconds and allows a longer sound to finish cleanly.
+7. The Oracle result opens after the celebration. Its Malayalam narration begins only when the new Oracle text is visible.
 
 Controls:
 
-- `Q` or `Esc` quits from the camera window or result window.
-- `R` restarts from the result window after the Oracle response is ready.
-- The Malayalam buttons in the result window restart or exit the app.
+- `Q` or `Esc` exits from the camera or Oracle result window.
+- The result buttons replay as the current player, change player, or exit.
 
 Gemma first receives both images and the measured telemetry. If that multimodal request fails, PottuAI retries the same model using telemetry only. If the Ollama server or both Gemma requests fail, the result UI uses a deterministic Malayalam fallback horoscope. Spoken guidance requires either previously cached direction clips or a valid Gemini API key; narration requires a valid key and a successful Gemini Live audio response.
 
@@ -196,16 +212,22 @@ Select a particular sink with `POTTU_AUDIO_SINK` if multiple Bluetooth devices a
 
 ```text
 .
-├── pottu_ai.py         # Current Gemma + Gemini Oracle Edition application
+├── game.py             # Current letter-player game and Oracle application
+├── audio/
+│   ├── win1.mp3        # Random celebration sound 1
+│   ├── win2.wav        # Random celebration sound 2
+│   ├── win3.wav        # Random celebration sound 3
+│   └── win4.wav        # Random celebration sound 4
+├── pottu_ai.py         # Earlier application entry point
 ├── requirements.txt    # Runtime Python dependencies
 ├── images/             # Prototype development photos
-├── models/             # Earlier face-model resources (not used by pottu_ai.py)
+├── models/             # Earlier face-model resources (not used by game.py)
 └── archive/            # Previous application iterations
 ```
 
 ## Troubleshooting
 
-If the camera cannot open, verify the index with `POTTU_CAMERA` and make sure no other program is using it. On Linux, `pottu_ai.py` opens the camera through V4L2.
+If the camera cannot open, verify the index with `POTTU_CAMERA` and make sure no other program is using it. On Linux, `game.py` opens the camera through V4L2.
 
 If `cv2.CascadeClassifier` or `cv2.imshow` is unavailable, remove conflicting or headless OpenCV distributions and reinstall the requirements:
 
@@ -220,7 +242,9 @@ python -m pip install --no-cache-dir --force-reinstall -r requirements.txt
 python -c "import cv2; print(cv2.__version__, cv2.CascadeClassifier)"
 ```
 
-If Malayalam text renders as boxes, install the Noto font packages above and restart the application. If no sound is heard, confirm that either `paplay` or `aplay` is installed and test the selected sink outside PottuAI.
+If Malayalam text renders as boxes, install the Noto font packages above and restart the application. If guidance or Oracle speech is silent, confirm that either `paplay` or `aplay` is installed and test the selected sink outside PottuAI. If celebration audio is silent, confirm that all four files exist under `audio/` and that the PySide6 installation includes `PySide6.QtMultimedia`.
+
+Only one celebration file is selected per win. Navigation audio is stopped as soon as the target is reached, celebration playback is stopped before opening the Oracle, and Oracle playback is cancelled on replay, player change, or exit. A generation guard also prevents a delayed response from an older Oracle request from playing during a later round.
 
 If the Oracle status shows `LOCAL GEMMA OFFLINE`, verify the Ollama server and model from the PottuAI machine:
 

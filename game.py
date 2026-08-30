@@ -127,6 +127,7 @@ HISTORY_FILE = Path(
 
 MAX_HISTORY = 6
 
+POTTU_CAPTURE_SECONDS = 3.0
 WIN_SCREEN_SECONDS = 5.0
 
 WIN_AUDIO_FILES = [
@@ -2852,6 +2853,150 @@ def frame_to_pixmap(
 
 
 # ------------------------------------------------------------
+# Three-second captured-pottu confirmation
+# ------------------------------------------------------------
+
+def make_pottu_snapshot(frame, pottu_position):
+    """Return a portrait snapshot with a clean pottu at the final position."""
+    snapshot = frame.copy()
+
+    if not pottu_position:
+        return snapshot
+
+    x, y = map(int, pottu_position)
+    height, width = snapshot.shape[:2]
+    radius = max(9, int(min(width, height) * 0.018))
+
+    # A dark rim keeps the pottu visible against every skin/background tone.
+    cv2.circle(
+        snapshot,
+        (x, y),
+        radius + 4,
+        (18, 8, 20),
+        -1,
+        cv2.LINE_AA,
+    )
+    cv2.circle(
+        snapshot,
+        (x, y),
+        radius,
+        (25, 25, 205),
+        -1,
+        cv2.LINE_AA,
+    )
+    cv2.circle(
+        snapshot,
+        (
+            x - max(2, radius // 3),
+            y - max(2, radius // 3),
+        ),
+        max(2, radius // 5),
+        (115, 115, 255),
+        -1,
+        cv2.LINE_AA,
+    )
+
+    return snapshot
+
+
+class PottuCaptureWindow(QWidget):
+    def __init__(self, frozen_frame, pottu_position):
+        super().__init__()
+
+        self.loop = QEventLoop()
+        self.finished = False
+        self.snapshot = make_pottu_snapshot(
+            frozen_frame,
+            pottu_position,
+        )
+
+        self.setWindowTitle(
+            "PottuAI - Pottu Captured"
+        )
+
+        self.photo = QLabel(self)
+        self.photo.setPixmap(
+            frame_to_pixmap(self.snapshot)
+        )
+        self.photo.setScaledContents(True)
+
+        self.banner = QFrame(self)
+        self.banner.setStyleSheet(
+            "QFrame {"
+            "background: rgba(8, 5, 12, 225);"
+            "border: 3px solid #ffcf4a;"
+            "border-radius: 25px;"
+            "}"
+        )
+
+        banner_layout = QVBoxLayout(self.banner)
+        banner_layout.setContentsMargins(28, 18, 28, 18)
+        banner_layout.setSpacing(5)
+
+        title = QLabel("POTTU CAPTURED SUCCESSFULLY")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            "color: #ffcf4a; background: transparent;"
+        )
+        title_font = QFont("DejaVu Sans", 25)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        banner_layout.addWidget(title)
+
+        subtitle = QLabel("Perfect placement saved")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setStyleSheet(
+            "color: white; background: transparent;"
+        )
+        subtitle.setFont(QFont("DejaVu Sans", 13))
+        banner_layout.addWidget(subtitle)
+
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.finish)
+
+    def resizeEvent(self, event):
+        width = self.width()
+        height = self.height()
+        self.photo.setGeometry(0, 0, width, height)
+
+        banner_width = min(760, max(520, int(width * 0.68)))
+        banner_height = 130
+        self.banner.setGeometry(
+            (width - banner_width) // 2,
+            height - banner_height - max(28, int(height * 0.05)),
+            banner_width,
+            banner_height,
+        )
+
+        super().resizeEvent(event)
+
+    def finish(self):
+        if self.finished:
+            return
+
+        self.finished = True
+        self.timer.stop()
+        self.hide()
+
+        if self.loop.isRunning():
+            self.loop.quit()
+
+    def closeEvent(self, event):
+        self.finish()
+        event.accept()
+
+    def exec_capture(self):
+        self.showFullScreen()
+        self.raise_()
+        self.activateWindow()
+        self.timer.start(
+            int(POTTU_CAPTURE_SECONDS * 1000)
+        )
+        self.loop.exec()
+
+
+# ------------------------------------------------------------
 # Five-second celebration UI + one-shot win audio
 # ------------------------------------------------------------
 
@@ -4237,6 +4382,7 @@ def run_game_round(
                             path_history
                         ),
                         "target": target,
+                        "pottu_position": marker,
                         "telemetry": telemetry,
                     }
 
@@ -4457,10 +4603,20 @@ def main():
                 ],
             )
 
-            # Generate the Oracle during the celebration. The celebration is
-            # at least five seconds and lets the chosen clip finish cleanly.
-            # Oracle speech starts only after its result UI is visible, so it
-            # cannot overlap the win sound.
+            # First show the successful portrait with a digital pottu placed
+            # exactly where the final red marker was detected.
+            capture_window = PottuCaptureWindow(
+                round_data["frame"],
+                round_data["pottu_position"],
+            )
+            capture_window.exec_capture()
+            capture_window.deleteLater()
+            qt_app.processEvents()
+
+            # Generate the Oracle during the capture/celebration stages. The
+            # celebration is at least five seconds and lets the chosen clip
+            # finish cleanly. Oracle speech starts only after its result UI is
+            # visible, so it cannot overlap the win sound.
             celebration_window = CelebrationWindow(
                 round_data["frame"]
             )

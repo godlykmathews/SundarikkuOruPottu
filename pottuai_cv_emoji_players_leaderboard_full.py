@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -140,17 +141,29 @@ PLAYER_EMOJIS = [
     "🌸",
     "👑",
     "⚡",
-    "🌙",
-    "🦋",
-    "🐘",
-    "🌴",
-    "🚀",
 ]
 
-EMOJI_HOLD_SECONDS = float(
+# Camera gesture recognition settings.
+# A player is selected only after the red marker traces most of a ring
+# around one emoji. Merely pointing at the emoji does not select it.
+EMOJI_GESTURE_WINDOW_SECONDS = float(
     os.environ.get(
-        "POTTU_EMOJI_HOLD_SECONDS",
-        "1.1",
+        "POTTU_EMOJI_GESTURE_WINDOW",
+        "3.2",
+    )
+)
+
+EMOJI_ANGLE_BINS = int(
+    os.environ.get(
+        "POTTU_EMOJI_ANGLE_BINS",
+        "24",
+    )
+)
+
+EMOJI_REQUIRED_COVERAGE = float(
+    os.environ.get(
+        "POTTU_EMOJI_REQUIRED_COVERAGE",
+        "0.72",
     )
 )
 
@@ -1211,46 +1224,294 @@ def save_history(telemetry, horoscope, persona):
         )
 
 
-# ------------------------------------------------------------
-# Red-marker emoji selector
-# ------------------------------------------------------------
 
-def _emoji_card_rects(width, height):
-    columns = 5
-    rows = 2
-
-    margin_x = max(28, int(width * 0.045))
-    top = max(105, int(height * 0.20))
-    bottom = max(34, int(height * 0.06))
-    gap = max(10, int(width * 0.012))
-
-    usable_width = width - 2 * margin_x - gap * (columns - 1)
-    usable_height = height - top - bottom - gap
-
-    card_width = usable_width / columns
-    card_height = usable_height / rows
-
-    rects = []
-    for row in range(rows):
-        for col in range(columns):
-            x1 = int(margin_x + col * (card_width + gap))
-            y1 = int(top + row * (card_height + gap))
-            x2 = int(x1 + card_width)
-            y2 = int(y1 + card_height)
-            rects.append((x1, y1, x2, y2))
-
-    return rects
-
-
-def _draw_emoji_text_on_frame(frame, rects):
+def ensure_emoji_player(
+    emoji,
+):
     """
-    Use Qt's Unicode/emoji renderer, then convert back to OpenCV.
-    This avoids cv2.putText() boxes for emoji.
+    The emoji itself is the persistent player identity.
+
+    Selecting 🎯 today and selecting 🎯 again later loads the same profile,
+    so its attempts and Oracle history remain attached to that emoji.
+    """
+    if emoji not in PLAYER_EMOJIS:
+        raise ValueError(
+            f"Unknown player emoji: {emoji}"
+        )
+
+    slot_index = (
+        PLAYER_EMOJIS.index(
+            emoji
+        )
+        + 1
+    )
+
+    player_id = (
+        f"emoji-player-{slot_index}"
+    )
+
+    players = load_players()
+
+    for player in players:
+        if player.get(
+            "id"
+        ) == player_id:
+            # Keep the display emoji current if configuration changes.
+            player["emoji"] = emoji
+            player["name"] = (
+                f"Player {slot_index}"
+            )
+            save_players(
+                players
+            )
+            return player
+
+    player = {
+        "id": player_id,
+        "name": (
+            f"Player {slot_index}"
+        ),
+        "emoji": emoji,
+        "created_at": time.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "rounds": [],
+    }
+
+    players.append(
+        player
+    )
+
+    save_players(
+        players
+    )
+
+    return player
+
+
+def leaderboard_rows():
+    """
+    Leaderboard ranking:
+      1) smallest successful final pixel error
+      2) fastest time for that best-error attempt
+
+    Every emoji slot is shown, including slots that have not played yet.
+    """
+    rows = []
+
+    for slot_index, emoji in enumerate(
+        PLAYER_EMOJIS,
+        start=1,
+    ):
+        player_id = (
+            f"emoji-player-{slot_index}"
+        )
+
+        player = get_player(
+            player_id
+        )
+
+        rounds = (
+            player.get(
+                "rounds",
+                []
+            )
+            if player
+            else []
+        )
+
+        attempts = []
+
+        for round_data in rounds:
+            telemetry = round_data.get(
+                "telemetry",
+                {}
+            )
+
+            error = telemetry.get(
+                "final_error"
+            )
+
+            seconds = telemetry.get(
+                "completion_time_seconds"
+            )
+
+            if isinstance(
+                error,
+                (int, float),
+            ):
+                attempts.append(
+                    (
+                        float(error),
+                        float(seconds)
+                        if isinstance(
+                            seconds,
+                            (int, float),
+                        )
+                        else 999999.0,
+                    )
+                )
+
+        if attempts:
+            best_error, best_time = min(
+                attempts,
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                ),
+            )
+
+            rows.append(
+                {
+                    "emoji": emoji,
+                    "slot": slot_index,
+                    "attempts": len(
+                        rounds
+                    ),
+                    "best_error": int(
+                        round(
+                            best_error
+                        )
+                    ),
+                    "best_time": best_time,
+                    "played": True,
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "emoji": emoji,
+                    "slot": slot_index,
+                    "attempts": 0,
+                    "best_error": None,
+                    "best_time": None,
+                    "played": False,
+                }
+            )
+
+    rows.sort(
+        key=lambda row: (
+            0 if row[
+                "played"
+            ] else 1,
+            (
+                row["best_error"]
+                if row[
+                    "best_error"
+                ] is not None
+                else 999999
+            ),
+            (
+                row["best_time"]
+                if row[
+                    "best_time"
+                ] is not None
+                else 999999
+            ),
+            row["slot"],
+        )
+    )
+
+    return rows
+
+
+# ------------------------------------------------------------
+# Red-marker circular-gesture player selector
+# ------------------------------------------------------------
+
+def _emoji_circle_geometry(
+    width,
+    height,
+):
+    """
+    Five large player targets in one row.
+
+    Each result:
+      {
+        center: (x, y),
+        radius: ring_radius,
+        emoji: "..."
+      }
+    """
+    count = len(
+        PLAYER_EMOJIS
+    )
+
+    usable_width = (
+        width * 0.88
+    )
+
+    start_x = (
+        width
+        - usable_width
+    ) / 2
+
+    spacing = (
+        usable_width
+        / count
+    )
+
+    center_y = int(
+        height * 0.53
+    )
+
+    radius = int(
+        min(
+            spacing * 0.34,
+            height * 0.17,
+        )
+    )
+
+    radius = max(
+        radius,
+        42,
+    )
+
+    items = []
+
+    for index, emoji in enumerate(
+        PLAYER_EMOJIS
+    ):
+        center_x = int(
+            start_x
+            + spacing
+            * (
+                index
+                + 0.5
+            )
+        )
+
+        items.append(
+            {
+                "center": (
+                    center_x,
+                    center_y,
+                ),
+                "radius": radius,
+                "emoji": emoji,
+            }
+        )
+
+    return items
+
+
+def _draw_emojis_qt(
+    frame,
+    geometries,
+):
+    """
+    Render the emoji glyphs using Qt so they do not appear as boxes.
     """
     from PySide6.QtGui import QPainter
 
-    height, width = frame.shape[:2]
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    height, width = frame.shape[
+        :2
+    ]
+
+    rgb = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2RGB,
+    )
 
     qimage = QImage(
         rgb.data,
@@ -1260,161 +1521,563 @@ def _draw_emoji_text_on_frame(frame, rects):
         QImage.Format_RGB888,
     ).copy()
 
-    painter = QPainter(qimage)
-    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter = QPainter(
+        qimage
+    )
 
-    emoji_font = QFont("Noto Color Emoji")
-    emoji_font.setPixelSize(max(42, int(height * 0.09)))
-    painter.setFont(emoji_font)
+    painter.setRenderHint(
+        QPainter.Antialiasing,
+        True,
+    )
 
-    for emoji, rect in zip(PLAYER_EMOJIS, rects):
-        x1, y1, x2, y2 = rect
+    font = QFont(
+        "Noto Color Emoji"
+    )
+
+    font.setPixelSize(
+        max(
+            44,
+            int(
+                height
+                * 0.10
+            ),
+        )
+    )
+
+    painter.setFont(
+        font
+    )
+
+    for item in geometries:
+        cx, cy = item[
+            "center"
+        ]
+
+        radius = item[
+            "radius"
+        ]
+
         painter.drawText(
-            x1,
-            y1,
-            x2 - x1,
-            y2 - y1,
-            int(Qt.AlignCenter),
-            emoji,
+            cx - radius,
+            cy - radius,
+            radius * 2,
+            radius * 2,
+            int(
+                Qt.AlignCenter
+            ),
+            item[
+                "emoji"
+            ],
         )
 
     painter.end()
 
-    # QImage owns its copy, so converting through bits is safe here.
     ptr = qimage.bits()
-    arr = np.frombuffer(
+
+    array = np.frombuffer(
         ptr,
         dtype=np.uint8,
         count=qimage.sizeInBytes(),
     )
 
-    bytes_per_line = qimage.bytesPerLine()
-    arr = arr.reshape(height, bytes_per_line)
-    arr = arr[:, : width * 3].reshape(height, width, 3)
+    bytes_per_line = (
+        qimage.bytesPerLine()
+    )
 
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    array = array.reshape(
+        height,
+        bytes_per_line,
+    )
+
+    array = array[
+        :,
+        : width * 3,
+    ].reshape(
+        height,
+        width,
+        3,
+    )
+
+    return cv2.cvtColor(
+        array,
+        cv2.COLOR_RGB2BGR,
+    )
 
 
-def run_emoji_selector(player_name):
+def _circle_coverage(
+    points,
+    center,
+    ring_radius,
+):
     """
-    Ten favourite-emoji choices controlled by the same physical red marker.
+    Measure how much of the emoji ring the red marker has traced.
 
-    The red marker acts as a cursor. Hold it inside a card for about one second
-    to confirm. No mouse is required.
+    We only use trajectory samples that lie in an annulus around the emoji,
+    so moving through the emoji center does not count as selecting it.
+
+    Returns:
+      coverage 0..1
+      valid_point_count
     """
-    if sys.platform.startswith("linux"):
-        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+    if not points:
+        return (
+            0.0,
+            0,
+        )
+
+    cx, cy = center
+
+    min_radius = (
+        ring_radius
+        * 0.70
+    )
+
+    max_radius = (
+        ring_radius
+        * 1.38
+    )
+
+    occupied_bins = set()
+    valid_count = 0
+
+    for _timestamp, (
+        px,
+        py,
+    ) in points:
+        dx = (
+            px - cx
+        )
+
+        dy = (
+            py - cy
+        )
+
+        distance = math.hypot(
+            dx,
+            dy,
+        )
+
+        if not (
+            min_radius
+            <= distance
+            <= max_radius
+        ):
+            continue
+
+        angle = (
+            math.atan2(
+                dy,
+                dx,
+            )
+            + math.pi
+        ) / (
+            2
+            * math.pi
+        )
+
+        bin_index = int(
+            angle
+            * EMOJI_ANGLE_BINS
+        ) % EMOJI_ANGLE_BINS
+
+        occupied_bins.add(
+            bin_index
+        )
+
+        valid_count += 1
+
+    coverage = (
+        len(
+            occupied_bins
+        )
+        / EMOJI_ANGLE_BINS
+    )
+
+    return (
+        coverage,
+        valid_count,
+    )
+
+
+def run_camera_player_selector():
+    """
+    No keyboard/mouse player selection.
+
+    The camera displays five emojis. The physical red marker must trace
+    a circle around one emoji. Once enough angular coverage is detected,
+    that emoji becomes CURRENT_PLAYER and the selector closes.
+
+    This is a real CV gesture:
+      red marker -> trajectory -> annulus filtering -> angular coverage.
+    """
+    if sys.platform.startswith(
+        "linux"
+    ):
+        cap = cv2.VideoCapture(
+            CAMERA_INDEX,
+            cv2.CAP_V4L2,
+        )
     else:
-        cap = cv2.VideoCapture(CAMERA_INDEX)
+        cap = cv2.VideoCapture(
+            CAMERA_INDEX
+        )
 
     if not cap.isOpened():
-        print("Could not open camera for emoji selection")
-        return None
+        raise RuntimeError(
+            "Could not open camera "
+            "for player selection."
+        )
 
-    hover_index = None
-    hover_started = 0.0
+    recent_points = deque()
+
+    selected_emoji = None
 
     try:
         while cap.isOpened():
-            ok, raw = cap.read()
+            ok, raw_frame = cap.read()
+
             if not ok:
                 return None
 
-            marker = detect_red_marker(raw)
-            frame = raw.copy()
-            height, width = frame.shape[:2]
+            now = time.monotonic()
 
-            # Darken the feed so cards remain readable.
-            black = np.zeros_like(frame)
-            cv2.addWeighted(frame, 0.40, black, 0.60, 0, frame)
+            marker = detect_red_marker(
+                raw_frame
+            )
+
+            if marker:
+                recent_points.append(
+                    (
+                        now,
+                        marker,
+                    )
+                )
+
+            while (
+                recent_points
+                and now
+                - recent_points[0][0]
+                > EMOJI_GESTURE_WINDOW_SECONDS
+            ):
+                recent_points.popleft()
+
+            frame = raw_frame.copy()
+
+            # Cinematic darkened camera background.
+            black = np.zeros_like(
+                frame
+            )
+
+            cv2.addWeighted(
+                frame,
+                0.40,
+                black,
+                0.60,
+                0,
+                frame,
+            )
+
+            height, width = frame.shape[
+                :2
+            ]
+
+            geometries = (
+                _emoji_circle_geometry(
+                    width,
+                    height,
+                )
+            )
+
+            best_index = None
+            best_coverage = 0.0
+            best_valid_count = 0
+
+            for index, item in enumerate(
+                geometries
+            ):
+                coverage, valid_count = (
+                    _circle_coverage(
+                        recent_points,
+                        item[
+                            "center"
+                        ],
+                        item[
+                            "radius"
+                        ],
+                    )
+                )
+
+                if coverage > best_coverage:
+                    best_index = index
+                    best_coverage = coverage
+                    best_valid_count = (
+                        valid_count
+                    )
+
+                cx, cy = item[
+                    "center"
+                ]
+
+                radius = item[
+                    "radius"
+                ]
+
+                active = (
+                    index
+                    == best_index
+                    and coverage
+                    > 0.05
+                )
+
+                circle_color = (
+                    (
+                        225,
+                        110,
+                        255,
+                    )
+                    if active
+                    else (
+                        115,
+                        115,
+                        125,
+                    )
+                )
+
+                cv2.circle(
+                    frame,
+                    (
+                        cx,
+                        cy,
+                    ),
+                    radius,
+                    circle_color,
+                    3,
+                    cv2.LINE_AA,
+                )
+
+                # Visualize recognized angular coverage as a progress arc.
+                progress_angle = int(
+                    min(
+                        1.0,
+                        coverage,
+                    )
+                    * 360
+                )
+
+                if progress_angle > 0:
+                    cv2.ellipse(
+                        frame,
+                        (
+                            cx,
+                            cy,
+                        ),
+                        (
+                            radius
+                            + 8,
+                            radius
+                            + 8,
+                        ),
+                        -90,
+                        0,
+                        progress_angle,
+                        (
+                            255,
+                            180,
+                            80,
+                        ),
+                        6,
+                        cv2.LINE_AA,
+                    )
+
+            # Unicode emoji drawn after OpenCV ring/card graphics.
+            frame = _draw_emojis_qt(
+                frame,
+                geometries,
+            )
 
             cv2.putText(
                 frame,
-                f"{player_name}: PICK YOUR EMOJI",
-                (24, 40),
+                "CIRCLE YOUR PLAYER EMOJI WITH THE RED MARKER",
+                (
+                    24,
+                    42,
+                ),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.82,
-                (255, 255, 255),
+                0.76,
+                (
+                    255,
+                    255,
+                    255,
+                ),
                 2,
                 cv2.LINE_AA,
             )
 
             cv2.putText(
                 frame,
-                "Move the RED marker into a card and hold",
-                (24, 73),
+                "Trace around the ring - pointing at the center does not select",
+                (
+                    24,
+                    72,
+                ),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.52,
-                (190, 190, 200),
+                0.46,
+                (
+                    190,
+                    190,
+                    205,
+                ),
                 1,
                 cv2.LINE_AA,
             )
 
-            rects = _emoji_card_rects(width, height)
-            selected_now = None
-
             if marker:
-                mx, my = marker
-                for index, (x1, y1, x2, y2) in enumerate(rects):
-                    if x1 <= mx <= x2 and y1 <= my <= y2:
-                        selected_now = index
-                        break
-
-            if selected_now != hover_index:
-                hover_index = selected_now
-                hover_started = (
-                    time.monotonic()
-                    if hover_index is not None
-                    else 0.0
+                cv2.circle(
+                    frame,
+                    marker,
+                    18,
+                    (
+                        0,
+                        0,
+                        255,
+                    ),
+                    3,
+                    cv2.LINE_AA,
                 )
 
-            held = (
-                time.monotonic() - hover_started
-                if hover_index is not None
-                else 0.0
-            )
+                cv2.circle(
+                    frame,
+                    marker,
+                    4,
+                    (
+                        255,
+                        255,
+                        255,
+                    ),
+                    -1,
+                    cv2.LINE_AA,
+                )
 
-            for index, (x1, y1, x2, y2) in enumerate(rects):
-                active = index == hover_index
+            if best_index is not None:
+                percentage = int(
+                    best_coverage
+                    * 100
+                )
 
-                fill = (70, 38, 86) if active else (25, 25, 31)
-                border = (220, 120, 255) if active else (72, 72, 82)
+                cv2.putText(
+                    frame,
+                    (
+                        f"CIRCLE DETECTED: "
+                        f"{percentage}%"
+                    ),
+                    (
+                        24,
+                        height - 28,
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (
+                        220,
+                        170,
+                        255,
+                    ),
+                    2,
+                    cv2.LINE_AA,
+                )
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), fill, -1)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), border, 2)
-
-                if active:
-                    progress = min(1.0, held / EMOJI_HOLD_SECONDS)
-                    usable = max(1, x2 - x1 - 12)
-                    cv2.rectangle(
-                        frame,
-                        (x1 + 6, y2 - 14),
-                        (x1 + 6 + int(usable * progress), y2 - 7),
-                        (220, 120, 255),
-                        -1,
+                # Angular coverage + enough marker samples prevents a single
+                # accidental sweep from logging in a player.
+                if (
+                    best_coverage
+                    >= EMOJI_REQUIRED_COVERAGE
+                    and best_valid_count
+                    >= max(
+                        14,
+                        int(
+                            EMOJI_ANGLE_BINS
+                            * 0.75
+                        ),
+                    )
+                ):
+                    selected_emoji = (
+                        PLAYER_EMOJIS[
+                            best_index
+                        ]
                     )
 
-            frame = _draw_emoji_text_on_frame(frame, rects)
+                    cv2.putText(
+                        frame,
+                        "PLAYER LOCKED",
+                        (
+                            int(
+                                width
+                                * 0.38
+                            ),
+                            int(
+                                height
+                                * 0.88
+                            ),
+                        ),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9,
+                        (
+                            0,
+                            255,
+                            0,
+                        ),
+                        3,
+                        cv2.LINE_AA,
+                    )
 
-            if marker:
-                cv2.circle(frame, marker, 17, (0, 0, 255), 3, cv2.LINE_AA)
-                cv2.circle(frame, marker, 4, (255, 255, 255), -1, cv2.LINE_AA)
+                    cv2.imshow(
+                        "PottuAI - Choose Player",
+                        frame,
+                    )
 
-            cv2.imshow("PottuAI - Choose Emoji", frame)
+                    cv2.waitKey(
+                        350
+                    )
 
-            if hover_index is not None and held >= EMOJI_HOLD_SECONDS:
-                chosen = PLAYER_EMOJIS[hover_index]
-                print(f"{player_name} selected {chosen}")
-                return chosen
+                    break
 
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+            cv2.imshow(
+                "PottuAI - Choose Player",
+                frame,
+            )
+
+            # No keyboard is required for normal use.
+            # Escape/Q remains only as an emergency developer exit.
+            key = (
+                cv2.waitKey(1)
+                & 0xFF
+            )
+
+            if key in (
+                ord("q"),
+                27,
+            ):
                 return None
 
     finally:
         cap.release()
-        cv2.destroyWindow("PottuAI - Choose Emoji")
-        cv2.waitKey(1)
+
+        try:
+            cv2.destroyWindow(
+                "PottuAI - Choose Player"
+            )
+        except cv2.error:
+            pass
+
+        cv2.waitKey(
+            1
+        )
+
+    if selected_emoji:
+        return ensure_emoji_player(
+            selected_emoji
+        )
+
+    return None
 
 
 # ------------------------------------------------------------
@@ -2597,11 +3260,9 @@ class OracleWindow(
     QWidget
 ):
     """
-    Mimics the UI reference:
-      dark cinematic background
-      purple title
-      centered quoted horoscope
-      minimal controls
+    Final result UI:
+      left  -> large Malayalam Oracle reading
+      right -> compact persistent emoji leaderboard
     """
 
     def __init__(
@@ -2618,8 +3279,8 @@ class OracleWindow(
         )
 
         self.setMinimumSize(
-            800,
-            520,
+            900,
+            560,
         )
 
         self.setStyleSheet(
@@ -2639,6 +3300,14 @@ class OracleWindow(
                 border-radius: 26px;
             }
 
+            QFrame#leaderCard {
+                background-color:
+                    rgba(15, 15, 20, 238);
+                border:
+                    1px solid #2c2c34;
+                border-radius: 22px;
+            }
+
             QLabel#oracleTitle {
                 color: #c86cff;
                 background: transparent;
@@ -2649,17 +3318,35 @@ class OracleWindow(
                 background: transparent;
             }
 
+            QLabel#leaderTitle {
+                color: #d9d9e3;
+                background: transparent;
+                font-weight: 700;
+            }
+
+            QLabel#leaderRow {
+                background: transparent;
+                color: #efeff4;
+            }
+
+            QLabel#leaderCurrent {
+                background: #2b1935;
+                color: #ffffff;
+                border-radius: 12px;
+                padding: 7px;
+            }
+
             QLabel#statusText {
                 color: #83838d;
                 background: transparent;
             }
 
             QPushButton {
-                color: #eeeeF2;
+                color: #eeeef2;
                 background: #18181d;
                 border: 1px solid #303037;
                 border-radius: 18px;
-                padding: 11px 24px;
+                padding: 11px 22px;
                 font-weight: 600;
             }
 
@@ -2680,10 +3367,6 @@ class OracleWindow(
             """
         )
 
-        # -------------------------
-        # Background frame
-        # -------------------------
-
         self.background = QLabel(
             self
         )
@@ -2698,7 +3381,6 @@ class OracleWindow(
             True
         )
 
-        # Dark overlay
         self.dark_overlay = QFrame(
             self
         )
@@ -2706,63 +3388,67 @@ class OracleWindow(
         self.dark_overlay.setStyleSheet(
             """
             background-color:
-                rgba(0, 0, 0, 218);
+                rgba(0, 0, 0, 220);
             """
         )
 
-        # -------------------------
-        # Card
-        # -------------------------
-
-        self.card = QFrame(
+        # Main full-screen composition.
+        self.root_panel = QFrame(
             self
         )
 
+        root_layout = QHBoxLayout(
+            self.root_panel
+        )
+
+        root_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        root_layout.setSpacing(
+            18
+        )
+
+        # -------------------------
+        # Left Oracle card
+        # -------------------------
+
+        self.card = QFrame()
         self.card.setObjectName(
             "oracleCard"
         )
 
-        shadow = (
-            QGraphicsDropShadowEffect(
-                self
-            )
+        shadow = QGraphicsDropShadowEffect(
+            self
         )
-
         shadow.setBlurRadius(
-            55
+            48
         )
-
         shadow.setOffset(
             0,
-            10,
+            8,
         )
-
         self.card.setGraphicsEffect(
             shadow
         )
 
-        layout = QVBoxLayout(
+        oracle_layout = QVBoxLayout(
             self.card
         )
 
-        layout.setContentsMargins(
-            55,
-            44,
-            55,
-            36,
+        oracle_layout.setContentsMargins(
+            46,
+            34,
+            46,
+            30,
         )
 
-        layout.setSpacing(
-            24
+        oracle_layout.setSpacing(
+            12
         )
-
-        layout.addStretch(
-            1
-        )
-
-        # -------------------------
-        # Title
-        # -------------------------
 
         self.title = QLabel(
             "ഓറക്കിൾ സംസാരിക്കുന്നു"
@@ -2778,7 +3464,7 @@ class OracleWindow(
 
         title_font = QFont(
             MALAYALAM_FONT_FAMILY,
-            25,
+            24,
         )
 
         title_font.setBold(
@@ -2789,30 +3475,56 @@ class OracleWindow(
             title_font
         )
 
-        layout.addWidget(
+        oracle_layout.addWidget(
             self.title
+        )
+
+        player_emoji = (
+            CURRENT_PLAYER.get(
+                "emoji",
+                "🙂",
+            )
+            if CURRENT_PLAYER
+            else "🙂"
+        )
+
+        player_attempts = (
+            len(
+                CURRENT_PLAYER.get(
+                    "rounds",
+                    [],
+                )
+            )
+            if CURRENT_PLAYER
+            else 0
         )
 
         self.player_label = QLabel(
             (
-                f"{CURRENT_PLAYER.get('emoji', '🙂')}  "
-                f"{CURRENT_PLAYER.get('name', 'Player')}"
+                f"{player_emoji}  "
+                f"Attempt {player_attempts + 1}"
             )
-            if CURRENT_PLAYER
-            else "🙂  Player"
         )
-        self.player_label.setAlignment(Qt.AlignCenter)
-        self.player_label.setStyleSheet(
-            "color:#9898a4; background:transparent;"
-        )
-        self.player_label.setFont(
-            QFont(MALAYALAM_FONT_FAMILY, 12)
-        )
-        layout.addWidget(self.player_label)
 
-        # -------------------------
-        # Horoscope text
-        # -------------------------
+        self.player_label.setAlignment(
+            Qt.AlignCenter
+        )
+
+        self.player_label.setStyleSheet(
+            "color:#9696a3; "
+            "background:transparent;"
+        )
+
+        self.player_label.setFont(
+            QFont(
+                MALAYALAM_FONT_FAMILY,
+                11,
+            )
+        )
+
+        oracle_layout.addWidget(
+            self.player_label
+        )
 
         self.oracle_label = QLabel(
             "നിങ്ങളുടെ കൈയാത്രയിൽ നിന്ന് "
@@ -2835,14 +3547,12 @@ class OracleWindow(
             Qt.PlainText
         )
 
-        # Critical for Malayalam:
-        # reserve real vertical space and add breathing room above/below
-        # so vowel marks / glyph extents are never clipped.
+        # Extra vertical padding prevents Malayalam top/bottom clipping.
         self.oracle_label.setContentsMargins(
-            24,
-            28,
-            24,
-            32,
+            22,
+            30,
+            22,
+            34,
         )
 
         self.oracle_label.setSizePolicy(
@@ -2851,41 +3561,23 @@ class OracleWindow(
         )
 
         self.oracle_label.setMinimumHeight(
-            220
-        )
-
-        self.oracle_label.setMaximumWidth(
-            1200
-        )
-
-        self.oracle_font_size = 20
-
-        text_font = QFont(
-            MALAYALAM_FONT_FAMILY,
-            self.oracle_font_size,
+            260
         )
 
         self.oracle_label.setFont(
-            text_font
+            QFont(
+                MALAYALAM_FONT_FAMILY,
+                20,
+            )
         )
 
-        # Give the horoscope area most of the available card height.
-        layout.addWidget(
+        oracle_layout.addWidget(
             self.oracle_label,
-            8,
-            Qt.AlignCenter,
+            1,
         )
-
-        layout.addSpacing(
-            10
-        )
-
-        # -------------------------
-        # Status
-        # -------------------------
 
         self.status_label = QLabel(
-            "Local Gemma 4 • gemma4:e2b"
+            "Oracle analysing..."
         )
 
         self.status_label.setObjectName(
@@ -2896,26 +3588,19 @@ class OracleWindow(
             Qt.AlignCenter
         )
 
-        status_font = QFont(
-            MALAYALAM_FONT_FAMILY,
-            10,
-        )
-
         self.status_label.setFont(
-            status_font
+            QFont(
+                MALAYALAM_FONT_FAMILY,
+                9,
+            )
         )
 
-        layout.addWidget(
+        oracle_layout.addWidget(
             self.status_label
         )
 
-        # -------------------------
-        # Buttons
-        # -------------------------
-
-        button_row = QHBoxLayout()
-
-        button_row.addStretch()
+        buttons = QHBoxLayout()
+        buttons.addStretch()
 
         self.restart_button = QPushButton(
             "വീണ്ടും കളിക്കുക"
@@ -2925,30 +3610,34 @@ class OracleWindow(
             "restartButton"
         )
 
-        restart_font = QFont(
-            MALAYALAM_FONT_FAMILY,
-            12,
+        self.restart_button.setFont(
+            QFont(
+                MALAYALAM_FONT_FAMILY,
+                11,
+            )
         )
 
-        self.restart_button.setFont(
-            restart_font
+        self.restart_button.setEnabled(
+            False
         )
 
         self.restart_button.clicked.connect(
             self.restart
         )
 
-        button_row.addWidget(
+        buttons.addWidget(
             self.restart_button
         )
 
         self.change_player_button = QPushButton(
             "Change Player"
         )
+
         self.change_player_button.clicked.connect(
             self.change_player
         )
-        button_row.addWidget(
+
+        buttons.addWidget(
             self.change_player_button
         )
 
@@ -2956,35 +3645,148 @@ class OracleWindow(
             "പുറത്തുകടക്കുക"
         )
 
-        quit_font = QFont(
-            MALAYALAM_FONT_FAMILY,
-            12,
-        )
-
         self.quit_button.setFont(
-            quit_font
+            QFont(
+                MALAYALAM_FONT_FAMILY,
+                11,
+            )
         )
 
         self.quit_button.clicked.connect(
             self.quit_app
         )
 
-        button_row.addWidget(
+        buttons.addWidget(
             self.quit_button
         )
 
-        button_row.addStretch()
+        buttons.addStretch()
 
-        layout.addLayout(
-            button_row
+        oracle_layout.addLayout(
+            buttons
         )
 
-        # Disable restart while Gemini is generating.
-        self.restart_button.setEnabled(
-            False
+        # -------------------------
+        # Right leaderboard
+        # -------------------------
+
+        self.leader_card = QFrame()
+        self.leader_card.setObjectName(
+            "leaderCard"
         )
 
-        # Poll oracle worker safely from Qt thread.
+        self.leader_card.setMinimumWidth(
+            235
+        )
+
+        self.leader_card.setMaximumWidth(
+            300
+        )
+
+        leader_layout = QVBoxLayout(
+            self.leader_card
+        )
+
+        leader_layout.setContentsMargins(
+            18,
+            22,
+            18,
+            20,
+        )
+
+        leader_layout.setSpacing(
+            10
+        )
+
+        leader_title = QLabel(
+            "LEADERBOARD"
+        )
+
+        leader_title.setObjectName(
+            "leaderTitle"
+        )
+
+        leader_title.setAlignment(
+            Qt.AlignCenter
+        )
+
+        leader_title.setFont(
+            QFont(
+                MALAYALAM_FONT_FAMILY,
+                13,
+            )
+        )
+
+        leader_layout.addWidget(
+            leader_title
+        )
+
+        leader_subtitle = QLabel(
+            "Best accuracy"
+        )
+
+        leader_subtitle.setAlignment(
+            Qt.AlignCenter
+        )
+
+        leader_subtitle.setStyleSheet(
+            "color:#777782;"
+        )
+
+        leader_subtitle.setFont(
+            QFont(
+                MALAYALAM_FONT_FAMILY,
+                9,
+            )
+        )
+
+        leader_layout.addWidget(
+            leader_subtitle
+        )
+
+        self.leader_rows_layout = QVBoxLayout()
+
+        self.leader_rows_layout.setSpacing(
+            7
+        )
+
+        leader_layout.addLayout(
+            self.leader_rows_layout
+        )
+
+        leader_layout.addStretch()
+
+        current_note = QLabel(
+            (
+                "Current player\n"
+                f"{player_emoji}"
+            )
+        )
+
+        current_note.setAlignment(
+            Qt.AlignCenter
+        )
+
+        current_note.setStyleSheet(
+            "color:#a9a9b3;"
+        )
+
+        leader_layout.addWidget(
+            current_note
+        )
+
+        root_layout.addWidget(
+            self.card,
+            5,
+        )
+
+        root_layout.addWidget(
+            self.leader_card,
+            2,
+        )
+
+        self.refresh_leaderboard()
+
         self.timer = QTimer(
             self
         )
@@ -2999,31 +3801,119 @@ class OracleWindow(
 
         self.timer.start()
 
-    def _fit_oracle_text(self):
-        """
-        Dynamically shrink the Malayalam horoscope font until the complete
-        paragraph fits inside the available label height.
+    def refresh_leaderboard(
+        self,
+    ):
+        # Delete old row widgets.
+        while (
+            self.leader_rows_layout.count()
+        ):
+            item = (
+                self.leader_rows_layout.takeAt(
+                    0
+                )
+            )
 
-        This prevents the first and last lines from being clipped on
-        Raspberry Pi displays with different resolutions/DPI scaling.
-        """
+            widget = item.widget()
+
+            if widget:
+                widget.deleteLater()
+
+        current_id = (
+            CURRENT_PLAYER.get(
+                "id"
+            )
+            if CURRENT_PLAYER
+            else None
+        )
+
+        rows = leaderboard_rows()
+
+        for rank, row in enumerate(
+            rows,
+            start=1,
+        ):
+            player_id = (
+                f"emoji-player-"
+                f"{row['slot']}"
+            )
+
+            if row[
+                "played"
+            ]:
+                time_text = (
+                    f"{row['best_time']:.1f}s"
+                    if row[
+                        "best_time"
+                    ] is not None
+                    else "--"
+                )
+
+                text = (
+                    f"{rank}.  "
+                    f"{row['emoji']}   "
+                    f"{row['best_error']}px\n"
+                    f"     {time_text}  •  "
+                    f"{row['attempts']} tries"
+                )
+            else:
+                text = (
+                    f"{rank}.  "
+                    f"{row['emoji']}   --\n"
+                    "     not played"
+                )
+
+            label = QLabel(
+                text
+            )
+
+            label.setWordWrap(
+                True
+            )
+
+            label.setFont(
+                QFont(
+                    MALAYALAM_FONT_FAMILY,
+                    10,
+                )
+            )
+
+            label.setObjectName(
+                (
+                    "leaderCurrent"
+                    if player_id
+                    == current_id
+                    else "leaderRow"
+                )
+            )
+
+            self.leader_rows_layout.addWidget(
+                label
+            )
+
+    def _fit_oracle_text(
+        self,
+    ):
         if not self.oracle_label.text():
             return
 
-        available_width = max(
-            320,
+        width = max(
+            300,
             self.oracle_label.width()
-            - 52,
+            - 50,
         )
 
-        available_height = max(
-            180,
+        height = max(
+            190,
             self.oracle_label.height()
-            - 64,
+            - 70,
         )
 
-        # Start large, then shrink only if required.
-        for point_size in range(22, 13, -1):
+        for point_size in range(
+            21,
+            12,
+            -1,
+        ):
             font = QFont(
                 MALAYALAM_FONT_FAMILY,
                 point_size,
@@ -3033,12 +3923,14 @@ class OracleWindow(
                 font
             )
 
-            metrics = self.oracle_label.fontMetrics()
+            metrics = (
+                self.oracle_label.fontMetrics()
+            )
 
-            bounding = metrics.boundingRect(
+            bounds = metrics.boundingRect(
                 0,
                 0,
-                available_width,
+                width,
                 10000,
                 int(
                     Qt.TextWordWrap
@@ -3047,67 +3939,61 @@ class OracleWindow(
                 self.oracle_label.text(),
             )
 
-            # Add extra safety for Malayalam vowel marks and line spacing.
-            required_height = (
-                bounding.height()
+            required = (
+                bounds.height()
                 + metrics.lineSpacing()
-                + 18
+                + 22
             )
 
-            if required_height <= available_height:
-                self.oracle_font_size = point_size
+            if required <= height:
                 break
 
     def resizeEvent(
         self,
         event,
     ):
-        size = self.size()
+        width = self.width()
+        height = self.height()
 
         self.background.setGeometry(
             0,
             0,
-            size.width(),
-            size.height(),
+            width,
+            height,
         )
 
         self.dark_overlay.setGeometry(
             0,
             0,
-            size.width(),
-            size.height(),
+            width,
+            height,
         )
 
         margin_x = max(
             24,
             int(
-                size.width()
-                * 0.055
+                width
+                * 0.045
             ),
         )
 
         margin_y = max(
             18,
             int(
-                size.height()
+                height
                 * 0.045
             ),
         )
 
-        self.card.setGeometry(
+        self.root_panel.setGeometry(
             margin_x,
             margin_y,
-            (
-                size.width()
-                - margin_x * 2
-            ),
-            (
-                size.height()
-                - margin_y * 2
-            ),
+            width
+            - margin_x * 2,
+            height
+            - margin_y * 2,
         )
 
-        # Re-fit text after the card/label geometry changes.
         QTimer.singleShot(
             0,
             self._fit_oracle_text,
@@ -3136,6 +4022,10 @@ class OracleWindow(
                 self._fit_oracle_text,
             )
 
+            # The round has now been saved by the Oracle worker,
+            # so refresh rankings to include this result.
+            self.refresh_leaderboard()
+
             self.restart_button.setEnabled(
                 True
             )
@@ -3146,7 +4036,6 @@ class OracleWindow(
         self,
     ):
         self.action = "RESTART"
-
         self.close()
 
         if self.loop.isRunning():
@@ -3157,6 +4046,7 @@ class OracleWindow(
     ):
         self.action = "CHANGE_PLAYER"
         self.close()
+
         if self.loop.isRunning():
             self.loop.quit()
 
@@ -3164,7 +4054,6 @@ class OracleWindow(
         self,
     ):
         self.action = "QUIT"
-
         self.close()
 
         if self.loop.isRunning():
@@ -3174,19 +4063,12 @@ class OracleWindow(
         self,
         event,
     ):
+        # Keyboard is not required, but keep Q/Escape as developer fallback.
         if event.key() in (
             Qt.Key_Q,
             Qt.Key_Escape,
         ):
             self.quit_app()
-            return
-
-        if (
-            event.key()
-            == Qt.Key_R
-            and self.restart_button.isEnabled()
-        ):
-            self.restart()
             return
 
         super().keyPressEvent(
@@ -3208,12 +4090,9 @@ class OracleWindow(
     def exec_result(
         self,
     ):
-        # Fullscreen is ideal for the demo.
         self.showFullScreen()
-
         self.raise_()
         self.activateWindow()
-
         self.loop.exec()
 
         return self.action
@@ -3629,12 +4508,18 @@ def run_game_round(
 # Main
 # ------------------------------------------------------------
 
-def choose_player():
-    selector = PlayerSelectWindow()
-    action, player = selector.exec_player()
-    selector.deleteLater()
+def choose_player_with_camera():
+    """
+    Player login is entirely camera/computer-vision driven.
+    No keyboard or mouse player picker.
+    """
+    player = (
+        run_camera_player_selector()
+    )
+
     QApplication.processEvents()
-    return action, player
+
+    return player
 
 
 def main():
@@ -3642,91 +4527,168 @@ def main():
     global CURRENT_PLAYER
 
     qt_app = QApplication.instance()
+
     if qt_app is None:
-        qt_app = QApplication(sys.argv)
+        qt_app = QApplication(
+            sys.argv
+        )
 
-    qt_app.setApplicationName("PottuAI")
-    MALAYALAM_FONT_FAMILY = install_app_font()
+    qt_app.setApplicationName(
+        "PottuAI"
+    )
 
-    detector = load_face_detector()
+    MALAYALAM_FONT_FAMILY = (
+        install_app_font()
+    )
+
+    detector = (
+        load_face_detector()
+    )
 
     print()
-    print("PottuAI - Player Edition")
-    print(f"Live voice: {LIVE_MODEL}")
-    print(f"Oracle: {ORACLE_MODEL} @ {OLLAMA_BASE_URL}")
-    print(f"Player database: {PLAYER_FILE}")
+    print(
+        "PottuAI - Emoji Player Edition"
+    )
+    print(
+        f"Live voice: {LIVE_MODEL}"
+    )
+    print(
+        f"Oracle: "
+        f"{ORACLE_MODEL} @ "
+        f"{OLLAMA_BASE_URL}"
+    )
+    print(
+        f"Player database: "
+        f"{PLAYER_FILE}"
+    )
     print()
 
-    if not os.environ.get("GEMINI_API_KEY"):
-        print("WARNING: GEMINI_API_KEY is not set; direction/oracle readout audio will be unavailable.")
+    if not os.environ.get(
+        "GEMINI_API_KEY"
+    ):
+        print(
+            "WARNING: GEMINI_API_KEY "
+            "is not set; voice will "
+            "be unavailable."
+        )
         print()
     else:
-        print("Preparing fast Gemini Malayalam guidance...")
-        live_voice.wait_until_ready(timeout=30)
-        print(f"Gemini voice status: {live_voice.status}")
+        print(
+            "Preparing fast Gemini "
+            "Malayalam guidance..."
+        )
+
+        live_voice.wait_until_ready(
+            timeout=30
+        )
+
+        print(
+            "Gemini voice status: "
+            f"{live_voice.status}"
+        )
         print()
 
     try:
-        choose_again = True
+        need_player_selection = True
 
         while True:
-            if choose_again:
-                action, player = choose_player()
-
-                if action != "PLAY" or not player:
-                    break
-
-                CURRENT_PLAYER = player
-                choose_again = False
-
+            if need_player_selection:
                 print(
-                    "Selected player: "
-                    f"{CURRENT_PLAYER.get('emoji', '🙂')} "
-                    f"{CURRENT_PLAYER.get('name', 'Player')}"
+                    "Opening camera player "
+                    "selector..."
                 )
 
-            # Refresh profile so new saved rounds are visible to Oracle context.
-            refreshed = get_player(CURRENT_PLAYER["id"])
-            if refreshed:
-                CURRENT_PLAYER = refreshed
+                CURRENT_PLAYER = (
+                    choose_player_with_camera()
+                )
 
-            round_data = run_game_round(detector)
+                if not CURRENT_PLAYER:
+                    break
+
+                print(
+                    "Player locked: "
+                    f"{CURRENT_PLAYER.get('emoji')}"
+                )
+
+                need_player_selection = (
+                    False
+                )
+
+            # Refresh saved rounds before each game.
+            refreshed = get_player(
+                CURRENT_PLAYER[
+                    "id"
+                ]
+            )
+
+            if refreshed:
+                CURRENT_PLAYER = (
+                    refreshed
+                )
+
+            round_data = (
+                run_game_round(
+                    detector
+                )
+            )
 
             if not round_data:
                 break
 
-            if round_data.get("quit"):
+            if round_data.get(
+                "quit"
+            ):
                 break
 
             oracle.start(
-                clean_frame=round_data["frame"],
-                path_history=round_data["path"],
-                target=round_data["target"],
-                telemetry=round_data["telemetry"],
+                clean_frame=round_data[
+                    "frame"
+                ],
+                path_history=round_data[
+                    "path"
+                ],
+                target=round_data[
+                    "target"
+                ],
+                telemetry=round_data[
+                    "telemetry"
+                ],
             )
 
-            result_window = OracleWindow(
-                round_data["frame"]
+            result_window = (
+                OracleWindow(
+                    round_data[
+                        "frame"
+                    ]
+                )
             )
 
-            action = result_window.exec_result()
+            action = (
+                result_window.exec_result()
+            )
+
             result_window.deleteLater()
+
             qt_app.processEvents()
 
             if action == "RESTART":
-                # Same player immediately gets another attempt.
+                # Same emoji player plays again.
                 continue
 
             if action == "CHANGE_PLAYER":
                 CURRENT_PLAYER = None
-                choose_again = True
+                need_player_selection = True
                 continue
 
             break
 
     finally:
-        esp32.send("STOP")
+        esp32.send(
+            "STOP"
+        )
+
         live_voice.close()
+
         cv2.destroyAllWindows()
 
 

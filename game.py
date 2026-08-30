@@ -19,8 +19,9 @@ import cv2
 import numpy as np
 import serial
 
-from PySide6.QtCore import Qt, QEventLoop, QTimer
+from PySide6.QtCore import Qt, QEventLoop, QTimer, QUrl
 from PySide6.QtGui import QFont, QFontDatabase, QImage, QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -125,6 +126,15 @@ HISTORY_FILE = Path(
 )
 
 MAX_HISTORY = 6
+
+WIN_SCREEN_SECONDS = 5.0
+
+WIN_AUDIO_FILES = [
+    Path(__file__).resolve().parent / "audio" / "win1.mp3",
+    Path(__file__).resolve().parent / "audio" / "win2.wav",
+    Path(__file__).resolve().parent / "audio" / "win3.wav",
+    Path(__file__).resolve().parent / "audio" / "win4.wav",
+]
 
 
 PLAYER_FILE = Path(
@@ -679,6 +689,8 @@ class GeminiLiveVoice:
 
         self.last_command = None
         self.last_command_time = 0.0
+        self.speech_lock = threading.Lock()
+        self.speech_generation = 0
 
         self.prewarm_thread = None
 
@@ -703,6 +715,19 @@ class GeminiLiveVoice:
     def reset_round(self):
         self.last_command = None
         self.last_command_time = 0.0
+        self.cancel_audio()
+
+    def cancel_audio(self):
+        """Stop playback and invalidate any Oracle audio still generating."""
+        with self.speech_lock:
+            self.speech_generation += 1
+            self.status = (
+                "READY"
+                if self.enabled
+                else "OFFLINE"
+            )
+
+        pcm_player.stop()
 
     def wait_until_ready(
         self,
@@ -1023,22 +1048,30 @@ Malayalam delivery ഉപയോഗിക്കുക.
             return
 
         # Stop any short direction clip before starting the final narration.
-        pcm_player.stop()
+        self.cancel_audio()
+
+        with self.speech_lock:
+            generation = self.speech_generation
 
         threading.Thread(
             target=self._oracle_speech_thread,
-            args=(text,),
+            args=(text, generation),
             daemon=True,
         ).start()
 
     def _oracle_speech_thread(
         self,
         text,
+        generation,
     ):
         try:
-            self.status = (
-                "ORACLE SPEAKING"
-            )
+            with self.speech_lock:
+                if generation != self.speech_generation:
+                    return
+
+                self.status = (
+                    "ORACLE SPEAKING"
+                )
 
             pcm = asyncio.run(
                 self._live_audio_request(
@@ -1057,6 +1090,10 @@ Malayalam delivery ഉപയോഗിക്കുക.
                     "no Oracle audio"
                 )
 
+            with self.speech_lock:
+                if generation != self.speech_generation:
+                    return
+
             pcm_player.request(
                 pcm,
                 interrupt=False,
@@ -1074,11 +1111,13 @@ Malayalam delivery ഉപയോഗിക്കുക.
             )
 
         finally:
-            self.status = "READY"
+            with self.speech_lock:
+                if generation == self.speech_generation:
+                    self.status = "READY"
 
     def close(self):
         self.close_event.set()
-        pcm_player.stop()
+        self.cancel_audio()
 
 
 live_voice = GeminiLiveVoice()
@@ -1964,9 +2003,11 @@ class GeminiOracle:
         self.text = None
         self.error = None
         self.persona = None
+        self.generation = 0
 
     def reset(self):
         with self.lock:
+            self.generation += 1
             self.busy = False
             self.status = "READY"
             self.text = None
@@ -2071,6 +2112,7 @@ class GeminiOracle:
             self.status = "GEMMA വിധി വായിക്കുന്നു..."
             self.text = None
             self.error = None
+            generation = self.generation
 
         self.persona = random.choice(
             ORACLE_PERSONAS
@@ -2084,6 +2126,7 @@ class GeminiOracle:
                 target,
                 dict(telemetry),
                 self.persona,
+                generation,
             ),
             daemon=True,
         ).start()
@@ -2197,6 +2240,7 @@ class GeminiOracle:
         target,
         telemetry,
         persona,
+        generation,
     ):
         try:
             diagnostic = self.build_private_path_image(
@@ -2312,6 +2356,9 @@ Output = Malayalam horoscope paragraph മാത്രം.
             )
 
             with self.lock:
+                if generation != self.generation:
+                    return
+
                 self.text = text
                 self.status = (
                     "LOCAL GEMMA ഓറക്കിൾ സംസാരിച്ചു"
@@ -2339,12 +2386,6 @@ Output = Malayalam horoscope paragraph മാത്രം.
             )
             print()
 
-            # Read the LOCAL Gemma-generated Malayalam paragraph aloud
-            # through the existing Gemini Live voice layer.
-            live_voice.speak_oracle(
-                text
-            )
-
         except Exception as exc:
             print(
                 "Local Gemma Oracle error: "
@@ -2356,20 +2397,19 @@ Output = Malayalam horoscope paragraph മാത്രം.
             )
 
             with self.lock:
+                if generation != self.generation:
+                    return
+
                 self.error = str(exc)
                 self.text = fallback
                 self.status = (
                     "LOCAL GEMMA OFFLINE"
                 )
 
-            # Preserve the demo even if the LAN/Ollama machine is down.
-            live_voice.speak_oracle(
-                fallback
-            )
-
         finally:
             with self.lock:
-                self.busy = False
+                if generation == self.generation:
+                    self.busy = False
 
     @staticmethod
     def _fallback(
@@ -2812,6 +2852,191 @@ def frame_to_pixmap(
 
 
 # ------------------------------------------------------------
+# Five-second celebration UI + one-shot win audio
+# ------------------------------------------------------------
+
+class CelebrationWindow(QWidget):
+    def __init__(self, frozen_frame):
+        super().__init__()
+
+        self.loop = QEventLoop()
+        self.finished = False
+        self.minimum_time_elapsed = False
+        self.audio_finished = False
+        self.win_audio = random.choice(
+            WIN_AUDIO_FILES
+        )
+
+        self.setWindowTitle(
+            "PottuAI - Congratulations"
+        )
+
+        self.background = QLabel(self)
+        self.background.setPixmap(
+            frame_to_pixmap(frozen_frame)
+        )
+        self.background.setScaledContents(True)
+
+        self.overlay = QFrame(self)
+        self.overlay.setStyleSheet(
+            "background-color: rgba(4, 0, 12, 220);"
+        )
+
+        self.panel = QFrame(self)
+        self.panel.setStyleSheet(
+            "QFrame {"
+            "background: rgba(30, 8, 48, 245);"
+            "border: 4px solid #ffd54a;"
+            "border-radius: 36px;"
+            "}"
+        )
+
+        layout = QVBoxLayout(self.panel)
+        layout.setContentsMargins(55, 45, 55, 45)
+        layout.setSpacing(18)
+        layout.addStretch()
+
+        title = QLabel("CONGRATULATIONS!")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            "color: #ffd54a; background: transparent;"
+        )
+        title_font = QFont("DejaVu Sans", 38)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        player_letter = (
+            CURRENT_PLAYER.get("emoji", "A")
+            if CURRENT_PLAYER
+            else "A"
+        )
+
+        winner = QLabel(f"PLAYER {player_letter} WINS")
+        winner.setAlignment(Qt.AlignCenter)
+        winner.setStyleSheet(
+            "color: white; background: transparent;"
+        )
+        winner_font = QFont("DejaVu Sans", 28)
+        winner_font.setBold(True)
+        winner.setFont(winner_font)
+        layout.addWidget(winner)
+
+        message = QLabel("TARGET ACHIEVED")
+        message.setAlignment(Qt.AlignCenter)
+        message.setStyleSheet(
+            "color: #f3b5ff; background: transparent;"
+        )
+        message.setFont(QFont("DejaVu Sans", 17))
+        layout.addWidget(message)
+        layout.addStretch()
+
+        self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(1.0)
+        self.media_player = QMediaPlayer(self)
+        self.media_player.setAudioOutput(
+            self.audio_output
+        )
+        self.media_player.mediaStatusChanged.connect(
+            self._media_status_changed
+        )
+        self.media_player.errorOccurred.connect(
+            self._media_error
+        )
+
+        self.finish_timer = QTimer(self)
+        self.finish_timer.setSingleShot(True)
+        self.finish_timer.timeout.connect(
+            self._minimum_time_finished
+        )
+
+        self.safety_timer = QTimer(self)
+        self.safety_timer.setSingleShot(True)
+        self.safety_timer.timeout.connect(
+            self.finish
+        )
+
+    def resizeEvent(self, event):
+        width = self.width()
+        height = self.height()
+        self.background.setGeometry(0, 0, width, height)
+        self.overlay.setGeometry(0, 0, width, height)
+
+        panel_width = min(850, max(560, int(width * 0.72)))
+        panel_height = min(430, max(330, int(height * 0.58)))
+        self.panel.setGeometry(
+            (width - panel_width) // 2,
+            (height - panel_height) // 2,
+            panel_width,
+            panel_height,
+        )
+
+        super().resizeEvent(event)
+
+    def start(self):
+        if self.win_audio.is_file():
+            print(f"Win audio: {self.win_audio.name}")
+            self.media_player.setSource(
+                QUrl.fromLocalFile(str(self.win_audio))
+            )
+            self.media_player.play()
+        else:
+            print(
+                f"WARNING: win audio missing: {self.win_audio}"
+            )
+            self.audio_finished = True
+
+        self.finish_timer.start(
+            int(WIN_SCREEN_SECONDS * 1000)
+        )
+        self.safety_timer.start(20000)
+
+    def _minimum_time_finished(self):
+        self.minimum_time_elapsed = True
+
+        if self.audio_finished:
+            self.finish()
+
+    def _media_status_changed(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.audio_finished = True
+
+            if self.minimum_time_elapsed:
+                self.finish()
+
+    def _media_error(self, error, error_text):
+        print(f"Win audio playback failed: {error_text}")
+        self.audio_finished = True
+
+        if self.minimum_time_elapsed:
+            self.finish()
+
+    def finish(self):
+        if self.finished:
+            return
+
+        self.finished = True
+        self.finish_timer.stop()
+        self.safety_timer.stop()
+        self.media_player.stop()
+        self.hide()
+
+        if self.loop.isRunning():
+            self.loop.quit()
+
+    def closeEvent(self, event):
+        self.finish()
+        event.accept()
+
+    def exec_celebration(self):
+        self.showFullScreen()
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(0, self.start)
+        self.loop.exec()
+
+
+# ------------------------------------------------------------
 # Qt Oracle UI
 # ------------------------------------------------------------
 
@@ -2834,6 +3059,7 @@ class OracleWindow(
 
         self.action = None
         self.loop = QEventLoop()
+        self.oracle_speech_started = False
 
         self.setWindowTitle(
             "PottuAI Oracle"
@@ -3578,6 +3804,12 @@ class OracleWindow(
                 + "”"
             )
 
+            if not self.oracle_speech_started:
+                self.oracle_speech_started = True
+                live_voice.speak_oracle(
+                    oracle.text
+                )
+
             QTimer.singleShot(
                 0,
                 self._fit_oracle_text,
@@ -3596,6 +3828,7 @@ class OracleWindow(
     def restart(
         self,
     ):
+        live_voice.cancel_audio()
         self.action = "RESTART"
         self.close()
 
@@ -3605,6 +3838,7 @@ class OracleWindow(
     def change_player(
         self,
     ):
+        live_voice.cancel_audio()
         self.action = "CHANGE_PLAYER"
         self.close()
 
@@ -3614,6 +3848,7 @@ class OracleWindow(
     def quit_app(
         self,
     ):
+        live_voice.cancel_audio()
         self.action = "QUIT"
         self.close()
 
@@ -3640,6 +3875,8 @@ class OracleWindow(
         self,
         event,
     ):
+        live_voice.cancel_audio()
+
         if self.action is None:
             self.action = "QUIT"
 
@@ -3936,6 +4173,10 @@ def run_game_round(
                 )
 
                 if command == "STOP":
+                    # Cut off the final direction clip immediately. The win
+                    # sound is the only audio allowed during celebration.
+                    live_voice.cancel_audio()
+
                     completion_time = (
                         time.monotonic()
                         - started_at
@@ -4215,6 +4456,17 @@ def main():
                     "telemetry"
                 ],
             )
+
+            # Generate the Oracle during the celebration. The celebration is
+            # at least five seconds and lets the chosen clip finish cleanly.
+            # Oracle speech starts only after its result UI is visible, so it
+            # cannot overlap the win sound.
+            celebration_window = CelebrationWindow(
+                round_data["frame"]
+            )
+            celebration_window.exec_celebration()
+            celebration_window.deleteLater()
+            qt_app.processEvents()
 
             result_window = (
                 OracleWindow(

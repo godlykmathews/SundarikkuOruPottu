@@ -1,4 +1,4 @@
-# PottuAI — Raspberry Pi Oracle Edition
+# Sundarikku Pottu Thoduna — PottuAI Cheat with Oracle
 
 PottuAI is a camera-based Onam game that guides a red marker toward a player's forehead and turns the completed hand path into a playful Malayalam horoscope.
 

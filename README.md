@@ -217,3 +217,16 @@ If Malayalam text renders as boxes, install the Noto font packages above and res
     <td width="50%"><img src="images/p2img4.jpeg" alt="Calibrating a micro servo" width="100%"></td>
   </tr>
 </table>
+
+### Phase 3
+
+<table>
+  <tr>
+    <td width="50%"><img src="images/p3img1.jpeg" alt="Phase 3 PottuAI development" width="100%"></td>
+    <td width="50%"><img src="images/p3img2.jpeg" alt="Phase 3 PottuAI testing" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="images/p3img3.jpeg" alt="Phase 3 PottuAI integration" width="100%"></td>
+    <td width="50%"><img src="images/p3img4.jpeg" alt="Phase 3 PottuAI demonstration" width="100%"></td>
+  </tr>
+</table>

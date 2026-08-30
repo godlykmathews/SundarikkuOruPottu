@@ -1,238 +1,219 @@
-# Sundarikku Pottu Thoduna
+# PottuAI — Raspberry Pi Oracle Edition
 
-An offline computer-vision prototype that guides a user toward a forehead target. The application detects the face, estimates the pottu position, tracks a red marker-tipped stick, and provides visual and spoken movement instructions.
+PottuAI is a camera-based Onam game that guides a red marker toward a player's forehead and turns the completed hand path into a playful Malayalam horoscope.
 
-Phase 1 focuses on validating the complete interaction using a USB camera, OpenCV, and edge-device-friendly processing. The target deployment platform is a Raspberry Pi 5.
+The current application is implemented in `pottuai.py`. OpenCV handles gameplay, Gemini Live provides cached Malayalam direction audio, Gemini generates the final Oracle reading, and PySide6 displays the result in a full-screen Malayalam UI. An optional ESP32 can receive the same movement commands over USB serial.
 
-Phase 2 adds a motorized pan-and-tilt camera prototype. Face-center coordinates are sent to an ESP32 so that two servos can move the camera and keep the user in view while the guidance system runs.
+The configured models are `gemini-3.1-flash-live-preview` for Malayalam audio and `gemini-3.7-flash` for the multimodal Oracle reading.
 
-## Phase 1 Features
+## Features
 
-- Detects a face and estimates the forehead target from the eye positions.
-- Tracks a small, saturated red marker tip.
-- Rejects large skin-coloured regions and sudden marker jumps.
-- Generates `LEFT`, `RIGHT`, `UP`, `DOWN`, `STOP`, and `PERFECT` guidance.
-- Displays the target, marker position, and direction on the camera feed.
-- Provides offline voice feedback using `espeak` on Linux.
-- Uses V4L2 for USB-camera capture on Raspberry Pi/Linux.
+- Detects the largest visible face with OpenCV's bundled Haar cascade.
+- Estimates the forehead target from the detected face rectangle.
+- Tracks a saturated red marker in HSV colour space.
+- Generates `LEFT`, `RIGHT`, `UP`, `DOWN`, and `STOP` commands.
+- Sends changed commands to an optional ESP32 at `115200` baud.
+- Uses Gemini Live to generate Malayalam direction clips and caches them locally for low-latency playback.
+- Records the marker path internally without displaying the trajectory during gameplay.
+- Measures completion time, path length, path efficiency, command counts, and direction reversals.
+- Sends the clean final frame, a private path visualization, telemetry, and recent results to Gemini for a unique Malayalam horoscope.
+- Reads the horoscope aloud and displays it in a full-screen PySide6 result window.
+- Keeps up to six recent readings in a local JSON history file.
+- Supports replaying another round without restarting the application.
 
-## Phase 2 Update
-
-Phase 2 moves the project from a fixed camera to a hardware-tracking setup. The current prototype combines a Raspberry Pi 5, a USB camera mounted on a two-axis servo rig, and an ESP32 movement controller.
-
-- Detects the center of the user's face from the live camera feed.
-- Sends the face-center coordinates to the ESP32 over USB serial.
-- Uses separate pan and tilt servos for horizontal and vertical camera movement.
-- Keeps red-marker tracking and offline spoken hand guidance in the same application.
-- Adds movement calibration, a center dead zone, and safe servo travel limits to the hardware-testing workflow.
-
-## Tech Stack
-
-- Python
-- OpenCV
-- NumPy
-- Haar cascade and YuNet face-detection resources
-- PySerial for Raspberry Pi-to-ESP32 communication
-- ESP32 with a two-axis servo camera mount
-- V4L2 USB-camera interface
-- eSpeak for offline voice guidance
-
-## How It Works
+## How it works
 
 ```text
 USB camera
     |
-    +--> YuNet face detection --> eye midpoint --> forehead target
+    +--> Haar face detection --> forehead target
     |
-    +--> HSV red-tip tracking ------------------> marker position
-                                                     |
-forehead target + marker position --> controller --> direction + voice
+    +--> HSV red-marker tracking --> marker position
+                                      |
+target + marker --> verified direction + path telemetry
+                         |                    |
+                         |                    +--> Gemini Oracle
+                         |                         + private path image
+                         |                         + Malayalam horoscope
+                         |                         + PySide6 result UI
+                         |
+                         +--> cached Gemini Malayalam audio
+                         +--> optional ESP32 command over serial
 ```
 
-The Phase 2 camera-tracking path is:
+The camera and OpenCV window are closed before the Oracle result window opens. The marker trajectory is never drawn on the public gameplay or result view; it is rendered only into the private diagnostic image used for the Oracle request.
 
-```text
-USB camera --> face detection --> face-center X/Y
-                                      |
-                                      v
-                              USB serial at 115200 baud
-                                      |
-                                      v
-                               ESP32 movement control
-                                      |
-                                      v
-                         pan servo + tilt servo --> camera movement
-```
+## Requirements
 
-## Project Structure
+- Python 3.10 or newer
+- A USB camera
+- A Gemini API key
+- An internet connection for initial direction-audio generation and each Oracle reading
+- `paplay` (PulseAudio/PipeWire) or `aplay` (ALSA) for spoken audio
+- A Malayalam font, preferably Noto Sans Malayalam
+- Optional: an ESP32 connected over USB serial
 
-```text
-.
-├── model.py            # Active vision, guidance, audio, and serial prototype
-├── models/             # Computer-vision model resources
-├── images/             # Phase 1 and Phase 2 development photos
-└── requirements.txt    # Python dependencies
-```
+## Raspberry Pi setup
 
-## Raspberry Pi 5 Setup
-
-Connect a USB camera, then install the system and Python dependencies:
+Install the system packages:
 
 ```bash
 sudo apt update
-sudo apt install -y python3-venv espeak pulseaudio-utils libgl1
+sudo apt install -y \
+  python3-venv \
+  pulseaudio-utils \
+  alsa-utils \
+  fonts-noto-core \
+  fonts-noto-extra \
+  libgl1
+```
 
+Create a virtual environment and install the Python dependencies:
+
+```bash
 python3 -m venv venv
 source venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-If OpenCV is incomplete or `cv2.CascadeClassifier` is missing, clean all
-conflicting OpenCV packages once and reinstall the requirements:
+Set the Gemini API key and start the app:
 
 ```bash
-python -m pip uninstall -y cv2 opencv-python opencv-python-headless \
-  opencv-contrib-python opencv-contrib-python-headless
-python -m pip install --no-cache-dir --force-reinstall -r requirements.txt
-python -c "import cv2; print(cv2.__version__, cv2.CascadeClassifier)"
+export GEMINI_API_KEY="your-api-key"
+python pottuai.py
 ```
 
-For later reinstalls, only the second and third commands are needed.
+On the first run, PottuAI asks Gemini Live to create five short Malayalam direction clips. It stores the raw PCM files in `.pottuai_gemini_audio/` and reuses them on later runs.
 
-Run the prototype:
+## Configuration
+
+All configuration is optional except `GEMINI_API_KEY` for Gemini voice and Oracle generation.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | unset | Enables Gemini direction audio and Oracle generation. |
+| `POTTU_CAMERA` | `0` | OpenCV camera index. |
+| `POTTU_SERIAL_PORT` | unset | ESP32 device, such as `/dev/ttyUSB0`; serial is disabled when unset. |
+| `POTTU_TARGET_TOLERANCE` | `30` | Target radius in pixels at which `STOP` is issued. |
+| `POTTU_AXIS_TOLERANCE` | `20` | Pixel dead zone used to choose the movement axis. |
+| `POTTU_GUIDANCE_COOLDOWN` | `1.3` | Seconds before repeating an unchanged spoken command. |
+| `POTTU_RED_MIN_AREA` | `500` | Minimum accepted red contour area in pixels. |
+| `POTTU_AUDIO_SINK` | automatic | PulseAudio/PipeWire sink name; useful for selecting a Bluetooth device. |
+| `POTTU_GEMINI_AUDIO_CACHE` | `.pottuai_gemini_audio` | Directory for cached 24 kHz mono PCM direction clips. |
+| `POTTU_HISTORY_FILE` | `pottuai_history.json` | JSON file that stores the six most recent Oracle results. |
+
+Example:
 
 ```bash
-python model.py
+POTTU_CAMERA=1 \
+POTTU_SERIAL_PORT=/dev/ttyACM0 \
+POTTU_AUDIO_SINK=bluez_output.YOUR_DEVICE_NAME \
+python pottuai.py
 ```
 
-Press `Q` in the camera window to exit.
+## Gameplay and controls
 
-### Phase 2 hardware tracking setup
+1. Keep one face clearly visible to the camera.
+2. Move a sufficiently large, saturated red marker toward the yellow forehead target.
+3. Follow the English on-screen command or the spoken Malayalam direction.
+4. When the marker enters the target radius, the app sends `STOP`, closes the camera view, and opens the Oracle result.
 
-The hardware prototype uses:
+Controls:
 
-- A Raspberry Pi 5 or development computer running `model.py`.
-- A USB camera attached to a two-axis pan-and-tilt bracket.
-- An ESP32 connected to the computer over USB.
-- Two hobby servos: one for horizontal pan and one for vertical tilt.
-- A suitable regulated servo power supply, jumper wires, and a shared ground between the servo supply and ESP32.
+- `Q` or `Esc` quits from the camera window or result window.
+- `R` restarts from the result window after the Oracle response is ready.
+- The Malayalam buttons in the result window restart or exit the app.
 
-Mount the camera securely on the tilt stage, then mount that assembly on the pan stage. Center both servos before attaching their horns so that the camera begins near the middle of its mechanical range. Connect the servo signal wires to the pins configured in the ESP32 firmware. Do not power both servos directly from a Raspberry Pi GPIO pin; use a suitable servo supply and connect the grounds together.
+If Gemini generation fails or the API key is missing, the result UI uses a deterministic Malayalam fallback horoscope. Spoken guidance requires either previously cached direction clips or a valid API key; Oracle narration requires a valid API key and a successful audio response.
 
-The ESP32 firmware should listen at `115200` baud for the space-separated face coordinates sent by `model.py`:
+## ESP32 serial integration
+
+Set `POTTU_SERIAL_PORT` to enable serial output. PottuAI sends newline-terminated command strings only when the command changes:
 
 ```text
-X Y\n
+LEFT\n
+RIGHT\n
+UP\n
+DOWN\n
+STOP\n
 ```
 
-The serial connection is disabled in the current checkout until a device port is selected. In the ESP32 initialization block in `model.py`, replace the disabled placeholder with the port detected on your system, for example:
-
-```python
-# Raspberry Pi/Linux example; the actual device may also be /dev/ttyACM0
-ser = serial.Serial("/dev/ttyUSB0", 115200, timeout=1)
-
-# Windows example
-# ser = serial.Serial("COM3", 115200, timeout=1)
-```
-
-List available serial ports with:
+The ESP32 firmware should listen at `115200` baud and map these commands to the project hardware. PottuAI sends `STOP` before closing the serial connection. List available ports with:
 
 ```bash
 python -m serial.tools.list_ports
 ```
 
-### Camera movement setup
+Use a regulated external supply for servos and connect the ESP32 and servo-supply grounds together. Do not power servos directly from Raspberry Pi GPIO.
 
-Calibrate the movement before enabling full face tracking:
+## Bluetooth/audio output
 
-1. Test the pan and tilt axes separately and reverse an axis in the ESP32 firmware if it moves away from the detected face.
-2. Set minimum and maximum servo angles that stop before the mount reaches a mechanical limit.
-3. Define the center of the camera frame and use a small dead zone around it to prevent constant servo jitter.
-4. Begin with small angle steps, then tune the response until the camera follows a moving face smoothly.
-5. Run `python model.py`, move in front of the camera, and confirm that the ESP32 receives `X Y` values before allowing both axes to move.
+Run PottuAI as the signed-in desktop user rather than with `sudo`. It prefers a detected Bluetooth PulseAudio/PipeWire sink, then the default PulseAudio/PipeWire sink, and finally the default ALSA device.
 
-The Python side currently sends coordinates when a serial connection is active. ESP32 movement firmware and its GPIO pin assignments must match the specific pan-and-tilt hardware being used.
-
-### Bluetooth headset output
-
-Pair and connect the headset in Raspberry Pi OS before starting the app. The
-application automatically prefers a connected Bluetooth audio sink; if none is
-available, it uses the current system default output.
-
-Run the app as the signed-in desktop user (not with `sudo`). Verify that the
-audio server is reachable, then list the available output sink names:
+Inspect available sinks with:
 
 ```bash
 pactl info
 pactl list short sinks
 ```
 
-If more than one Bluetooth headset is connected, select one explicitly:
+Select a particular sink with `POTTU_AUDIO_SINK` if multiple Bluetooth devices are connected.
 
-```bash
-POTTU_AUDIO_SINK=bluez_output.YOUR_DEVICE_NAME python model.py
+## Project structure
+
+```text
+.
+├── pottuai.py          # Current Oracle Edition application
+├── requirements.txt    # Runtime Python dependencies
+├── images/             # Prototype development photos
+├── models/             # Earlier face-model resources (not used by pottuai.py)
+└── archive/            # Previous application iterations
 ```
 
-## Phase 1 Development
+## Troubleshooting
+
+If the camera cannot open, verify the index with `POTTU_CAMERA` and make sure no other program is using it. On Linux, `pottuai.py` opens the camera through V4L2.
+
+If `cv2.CascadeClassifier` or `cv2.imshow` is unavailable, remove conflicting or headless OpenCV distributions and reinstall the requirements:
+
+```bash
+python -m pip uninstall -y \
+  cv2 \
+  opencv-python \
+  opencv-python-headless \
+  opencv-contrib-python \
+  opencv-contrib-python-headless
+python -m pip install --no-cache-dir --force-reinstall -r requirements.txt
+python -c "import cv2; print(cv2.__version__, cv2.CascadeClassifier)"
+```
+
+If Malayalam text renders as boxes, install the Noto font packages above and restart the application. If no sound is heard, confirm that either `paplay` or `aplay` is installed and test the selected sink outside PottuAI.
+
+## Development photos
+
+### Phase 1
 
 <table>
   <tr>
-    <td width="50%">
-      <img src="images/p1image1.jpg" alt="Testing the Phase 1 guidance prototype" width="100%">
-    </td>
-    <td width="50%">
-      <img src="images/p1image2.jpg" alt="Testing directional feedback from the camera application" width="100%">
-    </td>
+    <td width="50%"><img src="images/p1image1.jpg" alt="Testing the Phase 1 guidance prototype" width="100%"></td>
+    <td width="50%"><img src="images/p1image2.jpg" alt="Testing directional feedback from the camera application" width="100%"></td>
   </tr>
   <tr>
-    <td align="center"><sub>Testing the target and marker guidance</sub></td>
-    <td align="center"><sub>Validating real-time directional feedback</sub></td>
-  </tr>
-  <tr>
-    <td width="50%">
-      <img src="images/p1image3.jpg" alt="Team developing the Phase 1 hardware and software" width="100%">
-    </td>
-    <td width="50%">
-      <img src="images/p1image4.jpg" alt="Developing the connected hardware prototype" width="100%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center"><sub>Integrating the software and electronics</sub></td>
-    <td align="center"><sub>Building and testing the hardware controls</sub></td>
+    <td width="50%"><img src="images/p1image3.jpg" alt="Team developing the Phase 1 hardware and software" width="100%"></td>
+    <td width="50%"><img src="images/p1image4.jpg" alt="Developing the connected hardware prototype" width="100%"></td>
   </tr>
 </table>
 
-## Phase 2 Development
+### Phase 2
 
 <table>
   <tr>
-    <td width="50%">
-      <img src="images/p2img1.jpeg" alt="Raspberry Pi 5 edge-processing hardware for the Phase 2 prototype" width="100%">
-    </td>
-    <td width="50%">
-      <img src="images/p2img2.jpeg" alt="Motorized camera tracking mount connected to the control electronics" width="100%">
-    </td>
+    <td width="50%"><img src="images/p2img1.jpeg" alt="Raspberry Pi 5 edge-processing hardware" width="100%"></td>
+    <td width="50%"><img src="images/p2img2.jpeg" alt="Motorized camera mount and control electronics" width="100%"></td>
   </tr>
   <tr>
-    <td align="center"><sub>Preparing the Raspberry Pi 5 for Phase 2 tracking</sub></td>
-    <td align="center"><sub>Assembling the movable camera tracking rig</sub></td>
-  </tr>
-  <tr>
-    <td width="50%">
-      <img src="images/p2img3.jpeg" alt="Testing the Phase 2 camera tracking and movement setup" width="100%">
-    </td>
-    <td width="50%">
-      <img src="images/p2img4.jpeg" alt="Calibrating a micro servo for camera movement" width="100%">
-    </td>
-  </tr>
-  <tr>
-    <td align="center"><sub>Testing camera movement with live face tracking</sub></td>
-    <td align="center"><sub>Calibrating servo position and movement limits</sub></td>
+    <td width="50%"><img src="images/p2img3.jpeg" alt="Testing the camera movement setup" width="100%"></td>
+    <td width="50%"><img src="images/p2img4.jpeg" alt="Calibrating a micro servo" width="100%"></td>
   </tr>
 </table>
-
-## Project Status
-
-- **Phase 1:** The fixed-camera guidance prototype is working end to end. Ongoing work includes improving marker stability under different lighting conditions.
-- **Phase 2:** The Raspberry Pi, ESP32, pan-and-tilt camera mount, and servos are being integrated and tested. Serial communication is present in `model.py` but remains disabled until the correct device port is configured; movement calibration and safe servo limits are still in progress.
